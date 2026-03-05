@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use crate::{
     cli::Cli,
     config::ResolvedConfig,
-    delta::{apply_delta_ops, build_signature, choose_block_size, strong_hash128, BlockSig},
+    delta::{apply_delta_ops, build_signature, choose_block_size, BlockSig},
     hashing::{format_digest, hash_file},
     remote::{EntryKind, RemoteClient, RemoteEntry, RemoteSpec, SshRemote},
     state::{acquire_destination_lock, DeltaSessionState, StateStore},
@@ -35,6 +35,13 @@ pub struct RunSummary {
     pub delta_files: u64,
     pub delta_fallback_files: u64,
     pub bytes_saved: u64,
+    pub listing_ms: u64,
+    pub planning_ms: u64,
+    pub transfer_read_ms: u64,
+    pub transfer_write_ms: u64,
+    pub transfer_finalize_ms: u64,
+    pub metadata_ms: u64,
+    pub state_commit_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +69,10 @@ pub struct SyncOptions {
     pub delta_max_literals: u64,
     pub delta_helper: String,
     pub delta_fallback: bool,
+    pub strict_durability: bool,
+    pub verify_existing: bool,
+    pub sftp_read_concurrency: usize,
+    pub sftp_read_chunk_size: u64,
 }
 
 impl SyncOptions {
@@ -91,6 +102,10 @@ impl SyncOptions {
             delta_max_literals: resolved.delta_max_literals,
             delta_helper: resolved.delta_helper,
             delta_fallback: resolved.delta_fallback,
+            strict_durability: resolved.strict_durability,
+            verify_existing: resolved.verify_existing,
+            sftp_read_concurrency: resolved.sftp_read_concurrency,
+            sftp_read_chunk_size: resolved.sftp_read_chunk_size,
         })
     }
 }
@@ -108,18 +123,31 @@ struct TransferOutcome {
     bytes_saved: u64,
 }
 
+#[derive(Default)]
+struct PerfCounters {
+    transfer_read_ms: AtomicU64,
+    transfer_write_ms: AtomicU64,
+    transfer_finalize_ms: AtomicU64,
+    metadata_ms: AtomicU64,
+    state_commit_ms: AtomicU64,
+}
+
 pub fn run_sync(cli: Cli) -> Result<RunSummary> {
     let options = SyncOptions::from_cli(&cli)?;
     log_status(
         &options,
         format!(
-            "starting sync source={} dest={} jobs={} chunk_size={} threshold={} resume={}",
+            "starting sync source={} dest={} jobs={} chunk_size={} threshold={} resume={} strict_durability={} verify_existing={} sftp_read_concurrency={} sftp_read_chunk_size={}",
             cli.remote_source,
             cli.local_destination.display(),
             options.jobs,
             options.chunk_size,
             options.chunk_threshold,
-            options.resume
+            options.resume,
+            options.strict_durability,
+            options.verify_existing,
+            options.sftp_read_concurrency,
+            options.sftp_read_chunk_size
         ),
     );
     let spec = RemoteSpec::parse(&cli.remote_source)?;
@@ -130,9 +158,15 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
             spec.host, spec.port, spec.path
         ),
     );
-    log_status(&options, "establishing ssh connection pool...");
+    log_status(
+        &options,
+        "stage=connecting: establishing ssh connection pool...",
+    );
     let remote = SshRemote::connect(spec, options.jobs)?;
-    log_status(&options, "ssh connection pool established");
+    log_status(
+        &options,
+        "stage=connecting: ssh connection pool established",
+    );
     run_sync_with_client(&remote, &cli.local_destination, &options)
 }
 
@@ -158,13 +192,15 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     let destination_lock = acquire_destination_lock(&state_root)?;
     vlog(options, "destination lock acquired");
 
-    vlog(options, "listing remote entries...");
+    let listing_started = Instant::now();
+    log_status(options, "stage=listing: listing remote entries...");
     let mut entries = list_entries_with_spinner(remote, options)?;
     entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     vlog(
         options,
         format!("remote listing complete: {} entries", entries.len()),
     );
+    let listing_ms = listing_started.elapsed().as_millis() as u64;
 
     let state = Arc::new(Mutex::new(StateStore::load(&state_root)?));
     {
@@ -186,9 +222,11 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     let mut dir_count = 0_u64;
     let mut symlink_count = 0_u64;
     let mut file_count = 0_u64;
+    log_status(options, "stage=planning: building transfer plan...");
     let mut delta_eligible = 0_u64;
     let mut delta_planned = 0_u64;
     let mut skipped = 0_u64;
+    let planning_started = Instant::now();
 
     for entry in entries {
         check_interrupted()?;
@@ -248,6 +286,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
             }
         }
     }
+    let planning_ms = planning_started.elapsed().as_millis() as u64;
     let total_bytes: u64 = jobs.iter().map(|j| j.entry.size).sum();
     let plan_summary = PlanSummary {
         total_entries: file_count + dir_count + symlink_count,
@@ -261,6 +300,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         delta_planned,
     };
     print_plan_summary(options, &plan_summary);
+    log_status(options, "stage=transferring: starting file workers...");
     let ui = Arc::new(TransferUi::new(jobs.len() as u64, total_bytes, options));
 
     let transferred_files = AtomicU64::new(0);
@@ -269,6 +309,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     let delta_fallback_files = AtomicU64::new(0);
     let bytes_saved = AtomicU64::new(0);
     let errors: Arc<Mutex<Vec<anyhow::Error>>> = Arc::new(Mutex::new(Vec::new()));
+    let perf = Arc::new(PerfCounters::default());
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.jobs)
@@ -287,7 +328,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
                 return;
             }
 
-            let outcome = match transfer_one(remote, job, options, &state, &ui) {
+            let outcome = match transfer_one(remote, job, options, &state, &ui, &perf) {
                 Ok(v) => v,
                 Err(err) => {
                     let mut lock = errors.lock().expect("error lock");
@@ -329,9 +370,17 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         delta_files: delta_files.load(Ordering::Relaxed),
         delta_fallback_files: delta_fallback_files.load(Ordering::Relaxed),
         bytes_saved: bytes_saved.load(Ordering::Relaxed),
+        listing_ms,
+        planning_ms,
+        transfer_read_ms: perf.transfer_read_ms.load(Ordering::Relaxed),
+        transfer_write_ms: perf.transfer_write_ms.load(Ordering::Relaxed),
+        transfer_finalize_ms: perf.transfer_finalize_ms.load(Ordering::Relaxed),
+        metadata_ms: perf.metadata_ms.load(Ordering::Relaxed),
+        state_commit_ms: perf.state_commit_ms.load(Ordering::Relaxed),
     };
 
     drop(destination_lock);
+    log_status(options, "stage=finalizing: cleanup state directory...");
     if state_root.exists() {
         fs::remove_dir_all(&state_root)
             .with_context(|| format!("cleanup state root: {}", state_root.display()))?;
@@ -369,6 +418,9 @@ fn should_transfer(
                 && file_state.remote_mtime_secs == entry.mtime_secs
                 && file_state.finished
             {
+                if !options.verify_existing {
+                    return Ok(false);
+                }
                 if let Some(expected) = &file_state.digest_hex {
                     let actual = format_digest(hash_file(destination)?);
                     if &actual == expected {
@@ -388,6 +440,7 @@ fn transfer_one<R: RemoteClient + Sync>(
     options: &SyncOptions,
     state: &Arc<Mutex<StateStore>>,
     ui: &Arc<TransferUi>,
+    perf: &Arc<PerfCounters>,
 ) -> Result<TransferOutcome> {
     vlog(
         options,
@@ -407,7 +460,7 @@ fn transfer_one<R: RemoteClient + Sync>(
         && job.destination.exists()
         && !options.dry_run
     {
-        match transfer_one_delta(remote, job, options, state, ui) {
+        match transfer_one_delta(remote, job, options, state, ui, perf) {
             Ok(outcome) => return Ok(outcome),
             Err(err) => {
                 if options.delta_fallback {
@@ -430,7 +483,7 @@ fn transfer_one<R: RemoteClient + Sync>(
     for change_retry in 0..2 {
         check_interrupted()?;
         let chunk_size = if job.entry.size >= options.chunk_threshold {
-            options.chunk_size
+            options.chunk_size.min(options.sftp_read_chunk_size).max(1)
         } else {
             job.entry.size.max(1)
         };
@@ -458,6 +511,11 @@ fn transfer_one<R: RemoteClient + Sync>(
         let part_file = Arc::new(part_file);
 
         let chunk_count = chunk_count(job.entry.size, chunk_size);
+        let per_file_read_concurrency = if job.entry.size >= 32 * 1024 * 1024 {
+            options.sftp_read_concurrency.max(1)
+        } else {
+            1
+        };
         let completed = {
             let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
             locked
@@ -480,10 +538,12 @@ fn transfer_one<R: RemoteClient + Sync>(
         );
 
         let attempt_transferred = AtomicU64::new(0);
+        let completed_in_attempt = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let read_ms = Arc::new(AtomicU64::new(0));
+        let write_ms = Arc::new(AtomicU64::new(0));
 
-        missing_chunks
-            .par_iter()
-            .try_for_each(|idx| -> Result<()> {
+        for chunk_group in missing_chunks.chunks(per_file_read_concurrency) {
+            chunk_group.par_iter().try_for_each(|idx| -> Result<()> {
                 let offset = *idx * chunk_size;
                 let remain = job.entry.size.saturating_sub(offset);
                 let len = remain.min(chunk_size);
@@ -493,8 +553,13 @@ fn transfer_one<R: RemoteClient + Sync>(
                     if is_interrupted() {
                         return Err(anyhow!("interrupted by signal"));
                     }
+                    let read_started = Instant::now();
                     match remote.read_range(&job.entry.relative_path, offset, len) {
                         Ok(buf) => {
+                            read_ms.fetch_add(
+                                read_started.elapsed().as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
                             if buf.len() as u64 != len {
                                 last_err = Some(anyhow!(
                                     "short read for {}: expected {}, got {}",
@@ -504,17 +569,24 @@ fn transfer_one<R: RemoteClient + Sync>(
                                 ));
                                 continue;
                             }
+                            let write_started = Instant::now();
                             write_all_at(part_file.as_ref(), &buf, offset)?;
-
-                            let locked =
-                                state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                            locked.mark_chunk_completed(&job.entry.relative_path, *idx)?;
-                            locked.save()?;
+                            write_ms.fetch_add(
+                                write_started.elapsed().as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
+                            if let Ok(mut done) = completed_in_attempt.lock() {
+                                done.push(*idx);
+                            }
                             ui.inc_chunk_bytes(len);
                             attempt_transferred.fetch_add(len, Ordering::Relaxed);
                             return Ok(());
                         }
                         Err(err) => {
+                            read_ms.fetch_add(
+                                read_started.elapsed().as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
                             last_err = Some(err);
                         }
                     }
@@ -524,8 +596,29 @@ fn transfer_one<R: RemoteClient + Sync>(
                     .unwrap_or_else(|| anyhow!("chunk transfer failed"))
                     .context("chunk transfer failed after retries"))
             })?;
+        }
+        perf.transfer_read_ms
+            .fetch_add(read_ms.load(Ordering::Relaxed), Ordering::Relaxed);
+        perf.transfer_write_ms
+            .fetch_add(write_ms.load(Ordering::Relaxed), Ordering::Relaxed);
 
-        part_file.as_ref().sync_all()?;
+        let state_started = Instant::now();
+        {
+            let mut locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+            let completed = completed_in_attempt
+                .lock()
+                .map_err(|_| anyhow!("completed lock poisoned"))?;
+            locked.mark_chunks_completed_batch(&job.entry.relative_path, &completed)?;
+            locked.save()?;
+        }
+        perf.state_commit_ms.fetch_add(
+            state_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+
+        if options.strict_durability {
+            part_file.as_ref().sync_all()?;
+        }
         let latest = remote.stat_file(&job.entry.relative_path)?;
         if latest.size != job.entry.size || latest.mtime_secs != job.entry.mtime_secs {
             let already_counted = attempt_transferred.load(Ordering::Relaxed);
@@ -533,9 +626,16 @@ fn transfer_one<R: RemoteClient + Sync>(
                 ui.dec_chunk_bytes(already_counted);
             }
             let _ = fs::remove_file(&part_path);
-            let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-            locked.reset_progress(&job.entry.relative_path)?;
-            locked.save()?;
+            let state_started = Instant::now();
+            {
+                let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                locked.reset_progress(&job.entry.relative_path)?;
+                locked.save()?;
+            }
+            perf.state_commit_ms.fetch_add(
+                state_started.elapsed().as_millis() as u64,
+                Ordering::Relaxed,
+            );
             if change_retry == 0 {
                 continue;
             }
@@ -545,7 +645,7 @@ fn transfer_one<R: RemoteClient + Sync>(
             );
         }
 
-        let digest = format_digest(hash_file(&part_path)?);
+        let finalize_started = Instant::now();
         fs::rename(&part_path, &job.destination).with_context(|| {
             format!(
                 "rename partial to destination: {} -> {}",
@@ -554,6 +654,11 @@ fn transfer_one<R: RemoteClient + Sync>(
             )
         })?;
         apply_mtime(&job.destination, job.entry.mtime_secs)?;
+        perf.transfer_finalize_ms.fetch_add(
+            finalize_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        let metadata_started = Instant::now();
         apply_metadata(
             remote,
             &job.entry.relative_path,
@@ -561,10 +666,26 @@ fn transfer_one<R: RemoteClient + Sync>(
             &job.entry,
             options,
         )?;
+        perf.metadata_ms.fetch_add(
+            metadata_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
 
-        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-        locked.mark_finished_with_digest(&job.entry.relative_path, digest)?;
-        locked.save()?;
+        let state_started = Instant::now();
+        {
+            let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+            if options.verify_existing {
+                let digest = format_digest(hash_file(&job.destination)?);
+                locked.mark_finished_with_digest(&job.entry.relative_path, digest)?;
+            } else {
+                locked.mark_finished(&job.entry.relative_path)?;
+            }
+            locked.save()?;
+        }
+        perf.state_commit_ms.fetch_add(
+            state_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
         vlog(
             options,
             format!("transfer complete: {}", job.entry.relative_path.display()),
@@ -585,6 +706,7 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
     options: &SyncOptions,
     state: &Arc<Mutex<StateStore>>,
     ui: &Arc<TransferUi>,
+    perf: &Arc<PerfCounters>,
 ) -> Result<TransferOutcome> {
     let basis_path = &job.destination;
     let block_size = choose_block_size(job.entry.size, options.delta_block_size);
@@ -664,24 +786,37 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
         }
     };
 
-    let (written, last_op) =
+    let (written, last_op, digest_u128) =
         apply_delta_ops(basis_path, &part_path, &plan.ops, block_size, start_idx)?;
+    let state_started = Instant::now();
     {
         let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
         locked.mark_delta_op_progress(&job.entry.relative_path, last_op as u64)?;
         locked.save()?;
     }
+    perf.state_commit_ms.fetch_add(
+        state_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
     ui.inc_chunk_bytes(written);
 
-    let digest = format!("{:032x}", strong_hash128(&fs::read(&part_path)?));
+    let digest = format!("{digest_u128:032x}");
     if digest != plan.final_digest_hex {
         let _ = fs::remove_file(&part_path);
-        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-        locked.clear_delta_session(&job.entry.relative_path)?;
-        locked.save()?;
+        let state_started = Instant::now();
+        {
+            let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+            locked.clear_delta_session(&job.entry.relative_path)?;
+            locked.save()?;
+        }
+        perf.state_commit_ms.fetch_add(
+            state_started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
         bail!("delta final digest mismatch");
     }
 
+    let finalize_started = Instant::now();
     fs::rename(&part_path, &job.destination).with_context(|| {
         format!(
             "rename delta partial to destination: {} -> {}",
@@ -690,6 +825,11 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
         )
     })?;
     apply_mtime(&job.destination, job.entry.mtime_secs)?;
+    perf.transfer_finalize_ms.fetch_add(
+        finalize_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
+    let metadata_started = Instant::now();
     apply_metadata(
         remote,
         &job.entry.relative_path,
@@ -697,14 +837,29 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
         &job.entry,
         options,
     )?;
+    perf.metadata_ms.fetch_add(
+        metadata_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
 
-    let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-    locked.mark_delta_finished(&job.entry.relative_path)?;
-    locked.mark_finished_with_digest(
-        &job.entry.relative_path,
-        format_digest(hash_file(&job.destination)?),
-    )?;
-    locked.save()?;
+    let state_started = Instant::now();
+    {
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        locked.mark_delta_finished(&job.entry.relative_path)?;
+        if options.verify_existing {
+            locked.mark_finished_with_digest(
+                &job.entry.relative_path,
+                format_digest(hash_file(&job.destination)?),
+            )?;
+        } else {
+            locked.mark_finished(&job.entry.relative_path)?;
+        }
+        locked.save()?;
+    }
+    perf.state_commit_ms.fetch_add(
+        state_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
 
     Ok(TransferOutcome {
         used_delta: true,
@@ -773,6 +928,7 @@ fn list_entries_with_spinner<R: RemoteClient + Sync>(
     let style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
         .unwrap_or_else(|_| ProgressStyle::default_spinner());
     spinner.set_style(style);
+    spinner.set_message("Scanning remote tree... indexed 0 entries (0s)");
     let done = Arc::new(AtomicBool::new(false));
     let done_clone = Arc::clone(&done);
     let indexed_clone = Arc::clone(&indexed);
@@ -1352,6 +1508,10 @@ mod tests {
             delta_max_literals: 64 * 1024 * 1024,
             delta_helper: "prsync --internal-remote-helper".to_string(),
             delta_fallback: true,
+            strict_durability: false,
+            verify_existing: false,
+            sftp_read_concurrency: 4,
+            sftp_read_chunk_size: 4 * 1024 * 1024,
         }
     }
 

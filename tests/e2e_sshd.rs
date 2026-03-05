@@ -121,7 +121,7 @@ fn e2e_pull_over_sftp_with_resume_state() -> Result<()> {
         fs::read(destination.path().join("sub/nested.txt"))?,
         b"nested"
     );
-    assert!(destination.path().join(".prsync/state.db").exists());
+    assert!(!destination.path().join(".prsync").exists());
 
     Ok(())
 }

@@ -103,6 +103,22 @@ pub struct Cli {
     #[arg(long = "no-delta-fallback", action = ArgAction::SetTrue)]
     pub no_delta_fallback: bool,
 
+    /// Enable strict crash-durability semantics (extra fsync/checkpoint costs)
+    #[arg(long = "strict-durability", action = ArgAction::SetTrue)]
+    pub strict_durability: bool,
+
+    /// Verify digests for already-existing files before skip decisions (expensive)
+    #[arg(long = "verify-existing", action = ArgAction::SetTrue)]
+    pub verify_existing: bool,
+
+    /// Parallel SFTP read requests per file for large files
+    #[arg(long = "sftp-read-concurrency")]
+    pub sftp_read_concurrency: Option<usize>,
+
+    /// SFTP range request chunk size in bytes
+    #[arg(long = "sftp-read-chunk-size")]
+    pub sftp_read_chunk_size: Option<u64>,
+
     /// SSH remote source spec: `[user@]host:/path`
     pub remote_source: String,
 

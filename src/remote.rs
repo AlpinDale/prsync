@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ssh2::{FileStat, Session, Sftp};
+use ssh2::{File, FileStat, Session, Sftp};
 
 use crate::delta::protocol::{BlockSigWire, DeltaPlan, HelperRequest, HelperResponse};
 
@@ -616,6 +616,8 @@ fn resolve_connect_target(spec: &RemoteSpec) -> Result<ConnectTarget> {
 struct Connection {
     session: Session,
     sftp: Sftp,
+    open_read_path: Option<PathBuf>,
+    open_read_file: Option<File>,
 }
 
 struct ExecOutput {
@@ -638,7 +640,12 @@ impl Connection {
 
         authenticate_session(&session, target)?;
         let sftp = session.sftp().context("create sftp session")?;
-        Ok(Self { session, sftp })
+        Ok(Self {
+            session,
+            sftp,
+            open_read_path: None,
+            open_read_file: None,
+        })
     }
 
     fn readdir(&mut self, path: &Path) -> Result<Vec<(PathBuf, FileStat)>> {
@@ -660,10 +667,25 @@ impl Connection {
     }
 
     fn read_range(&mut self, path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let mut file = self
-            .sftp
-            .open(path)
-            .with_context(|| format!("sftp open failed: {}", path.display()))?;
+        let needs_open = self
+            .open_read_path
+            .as_ref()
+            .map(|p| p != path)
+            .unwrap_or(true)
+            || self.open_read_file.is_none();
+        if needs_open {
+            self.open_read_file = Some(
+                self.sftp
+                    .open(path)
+                    .with_context(|| format!("sftp open failed: {}", path.display()))?,
+            );
+            self.open_read_path = Some(path.to_path_buf());
+        }
+
+        let file = self
+            .open_read_file
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing open sftp file handle"))?;
         file.seek(SeekFrom::Start(offset))
             .with_context(|| format!("sftp seek failed: {}", path.display()))?;
 

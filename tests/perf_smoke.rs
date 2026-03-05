@@ -118,6 +118,10 @@ fn opts(jobs: usize) -> SyncOptions {
         delta_max_literals: 64 * 1024 * 1024,
         delta_helper: "prsync --internal-remote-helper".to_string(),
         delta_fallback: true,
+        strict_durability: false,
+        verify_existing: false,
+        sftp_read_concurrency: 4,
+        sftp_read_chunk_size: 4 * 1024 * 1024,
     }
 }
 

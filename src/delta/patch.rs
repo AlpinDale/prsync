@@ -11,12 +11,13 @@ pub fn apply_delta_ops(
     ops: &[DeltaOp],
     block_size: u32,
     start_op_index: usize,
-) -> Result<(u64, usize)> {
+) -> Result<(u64, usize, u128)> {
     let mut basis = File::open(basis_path)
         .with_context(|| format!("open basis file: {}", basis_path.display()))?;
     let mut out = File::create(output_path)
         .with_context(|| format!("open delta output: {}", output_path.display()))?;
     let mut written = 0_u64;
+    let mut md5_ctx = md5::Context::new();
 
     for (idx, op) in ops.iter().enumerate().skip(start_op_index) {
         match op {
@@ -25,6 +26,7 @@ pub fn apply_delta_ops(
                 let mut tmp = vec![0_u8; *len as usize];
                 read_exact_at(&mut basis, offset, &mut tmp)?;
                 out.write_all(&tmp)?;
+                md5_ctx.consume(&tmp);
                 written += *len as u64;
             }
             DeltaOp::Literal { data_b64 } => {
@@ -32,6 +34,7 @@ pub fn apply_delta_ops(
                     .decode(data_b64)
                     .map_err(|e| anyhow!("decode literal: {e}"))?;
                 out.write_all(&buf)?;
+                md5_ctx.consume(&buf);
                 written += buf.len() as u64;
             }
         }
@@ -40,7 +43,8 @@ pub fn apply_delta_ops(
         }
     }
     out.sync_all()?;
-    Ok((written, ops.len()))
+    let digest = u128::from_be_bytes(md5_ctx.compute().0);
+    Ok((written, ops.len(), digest))
 }
 
 fn read_exact_at(file: &mut File, offset: usize, out: &mut [u8]) -> Result<()> {

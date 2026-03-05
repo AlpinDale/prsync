@@ -19,6 +19,10 @@ pub struct ResolvedConfig {
     pub delta_max_literals: u64,
     pub delta_helper: String,
     pub delta_fallback: bool,
+    pub strict_durability: bool,
+    pub verify_existing: bool,
+    pub sftp_read_concurrency: usize,
+    pub sftp_read_chunk_size: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -35,6 +39,10 @@ struct FileConfig {
     delta_max_literals: Option<u64>,
     delta_helper: Option<String>,
     delta_fallback: Option<bool>,
+    strict_durability: Option<bool>,
+    verify_existing: Option<bool>,
+    sftp_read_concurrency: Option<usize>,
+    sftp_read_chunk_size: Option<u64>,
 }
 
 impl ResolvedConfig {
@@ -120,6 +128,32 @@ impl ResolvedConfig {
                 .or(file_cfg.delta_fallback)
                 .unwrap_or(true)
         };
+        let strict_durability = if cli.strict_durability {
+            true
+        } else {
+            env_parse::<bool>("PRSYNC_STRICT_DURABILITY")
+                .or(file_cfg.strict_durability)
+                .unwrap_or(false)
+        };
+        let verify_existing = if cli.verify_existing {
+            true
+        } else {
+            env_parse::<bool>("PRSYNC_VERIFY_EXISTING")
+                .or(file_cfg.verify_existing)
+                .unwrap_or(false)
+        };
+        let sftp_read_concurrency = cli
+            .sftp_read_concurrency
+            .or_else(|| env_parse::<usize>("PRSYNC_SFTP_READ_CONCURRENCY"))
+            .or(file_cfg.sftp_read_concurrency)
+            .unwrap_or(4)
+            .max(1);
+        let sftp_read_chunk_size = cli
+            .sftp_read_chunk_size
+            .or_else(|| env_parse::<u64>("PRSYNC_SFTP_READ_CHUNK_SIZE"))
+            .or(file_cfg.sftp_read_chunk_size)
+            .unwrap_or(4 * 1024 * 1024)
+            .max(1);
 
         Ok(Self {
             jobs,
@@ -134,6 +168,10 @@ impl ResolvedConfig {
             delta_max_literals,
             delta_helper,
             delta_fallback,
+            strict_durability,
+            verify_existing,
+            sftp_read_concurrency,
+            sftp_read_chunk_size,
         })
     }
 }

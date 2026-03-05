@@ -271,6 +271,23 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn mark_chunks_completed_batch(&mut self, rel: &Path, chunks: &[u64]) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let key = Self::key_for(rel);
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx
+                .prepare("INSERT OR IGNORE INTO file_chunks(path_key, chunk_idx) VALUES(?1, ?2)")?;
+            for idx in chunks {
+                stmt.execute(params![&key, *idx as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn part_path_for(&self, rel: &Path) -> PathBuf {
         let key = Self::key_for(rel);
         self.partials_dir.join(part_name_for(&key))
@@ -294,6 +311,15 @@ impl StateStore {
         self.conn.execute(
             "UPDATE files SET finished = 1, digest_hex = ?2 WHERE path_key = ?1",
             params![key, digest_hex],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_finished(&self, rel: &Path) -> Result<()> {
+        let key = Self::key_for(rel);
+        self.conn.execute(
+            "UPDATE files SET finished = 1, digest_hex = NULL WHERE path_key = ?1",
+            params![key],
         )?;
         Ok(())
     }

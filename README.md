@@ -28,22 +28,24 @@ prsync -vrPlu user@example.com:2222:/remote/path /local/destination
 
 Reading the hostname from SSH config is also supported.
 
-## Key behavior
-
-- `-r`: recursive directory sync
-- `-v`: verbose summary
-- `-P`: partial + progress mode
-- `-l`: preserve symlinks
-- `-u`: skip if destination file is newer than source
-- `--resume` / `--no-resume`: explicit resume policy override
-- Resume state is stored in `/local/destination/.prsync/state.db`
-- Active run lock is `/local/destination/.prsync/lock`
-
 ## Performance tuning
 
 ```bash
 prsync -vrPlu --jobs 16 --chunk-size 16777216 --chunk-threshold 134217728 user@host:/src /dst
 ```
+
+Balanced mode defaults:
+
+- No per-file `sync_all` barriers (atomic rename still preserved)
+- Existing-file digest checks are skipped unless requested
+- Chunk completion state is committed in batches
+
+Throughput flags:
+
+- `--strict-durability`: enable fsync-heavy strict mode
+- `--verify-existing`: hash existing files before skip decisions
+- `--sftp-read-concurrency`: parallel per-file read requests for large files
+- `--sftp-read-chunk-size`: read request size for SFTP range pulls
 
 ## Delta mode (opt-in)
 
@@ -71,14 +73,22 @@ Remote helper deployment:
 ## Config and precedence
 
 - Optional config file: `~/.config/prsync/config.toml`
-- Supported keys: `jobs`, `chunk_size`, `chunk_threshold`, `retries`, `resume`, `state_dir`, `delta_enabled`, `delta_min_size`, `delta_block_size`, `delta_max_literals`, `delta_helper`, `delta_fallback`
-- Environment overrides: `PRSYNC_JOBS`, `PRSYNC_CHUNK_SIZE`, `PRSYNC_CHUNK_THRESHOLD`, `PRSYNC_RETRIES`, `PRSYNC_RESUME`, `PRSYNC_STATE_DIR`, `PRSYNC_DELTA`, `PRSYNC_DELTA_MIN_SIZE`, `PRSYNC_DELTA_BLOCK_SIZE`, `PRSYNC_DELTA_MAX_LITERALS`, `PRSYNC_DELTA_HELPER`, `PRSYNC_DELTA_FALLBACK`
+- Supported keys: `jobs`, `chunk_size`, `chunk_threshold`, `retries`, `resume`, `state_dir`, `delta_enabled`, `delta_min_size`, `delta_block_size`, `delta_max_literals`, `delta_helper`, `delta_fallback`, `strict_durability`, `verify_existing`, `sftp_read_concurrency`, `sftp_read_chunk_size`
+- Environment overrides: `PRSYNC_JOBS`, `PRSYNC_CHUNK_SIZE`, `PRSYNC_CHUNK_THRESHOLD`, `PRSYNC_RETRIES`, `PRSYNC_RESUME`, `PRSYNC_STATE_DIR`, `PRSYNC_DELTA`, `PRSYNC_DELTA_MIN_SIZE`, `PRSYNC_DELTA_BLOCK_SIZE`, `PRSYNC_DELTA_MAX_LITERALS`, `PRSYNC_DELTA_HELPER`, `PRSYNC_DELTA_FALLBACK`, `PRSYNC_STRICT_DURABILITY`, `PRSYNC_VERIFY_EXISTING`, `PRSYNC_SFTP_READ_CONCURRENCY`, `PRSYNC_SFTP_READ_CHUNK_SIZE`
 The order of precedence is CLI > env > config file > built-in defaults.
 
 You can override state location explicitly:
 
 ```bash
 prsync -vrPlu --state-dir /var/tmp/prsync-state user@host:/src /dst
+```
+
+## Benchmark harness
+
+Run comparable local measurements against `prsync`, `rclone`, and `rsync`:
+
+```bash
+./scripts/bench_sftp.sh user@host:/src /tmp/prsync-bench 5 16
 ```
 
 ## Metadata flags
