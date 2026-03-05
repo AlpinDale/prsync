@@ -5,6 +5,9 @@ essence, a parallelized `rsync` implementation.
 
 ![demo](assets/demo.gif)
 
+## Installation
+Download the binary for your platform from the [releases page](https://github.com/AlpinDale/prsync/releases).
+
 ## Building
 
 Make sure you have Rust stable installed (via rustup), then:
