@@ -817,6 +817,14 @@ impl Connection {
     }
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Keep shutdown snappy; transfer-time timeout remains higher.
+        self.session.set_timeout(150);
+        let _ = self.session.disconnect(None, "prsync shutdown", None);
+    }
+}
+
 fn authenticate_session(session: &Session, target: &ConnectTarget) -> Result<()> {
     if session.userauth_agent(&target.user).is_ok() && session.authenticated() {
         return Ok(());

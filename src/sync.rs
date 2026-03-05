@@ -167,7 +167,21 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
         &options,
         "stage=connecting: ssh connection pool established",
     );
-    run_sync_with_client(&remote, &cli.local_destination, &options)
+    let summary = run_sync_with_client(&remote, &cli.local_destination, &options)?;
+    let disconnect_started = Instant::now();
+    log_status(
+        &options,
+        "stage=disconnecting: closing ssh connection pool...",
+    );
+    drop(remote);
+    log_status(
+        &options,
+        format!(
+            "stage=disconnecting: closed ssh connection pool in {}ms",
+            disconnect_started.elapsed().as_millis()
+        ),
+    );
+    Ok(summary)
 }
 
 pub fn run_sync_with_client<R: RemoteClient + Sync>(
