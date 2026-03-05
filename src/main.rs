@@ -20,9 +20,10 @@ fn main() -> ExitCode {
         Ok(summary) => {
             if debug {
                 eprintln!(
-                    "completed: transferred={}, skipped={}, bytes={}, delta_files={}, delta_fallbacks={}, bytes_saved={}, listing_ms={}, planning_ms={}, read_ms={}, write_ms={}, finalize_ms={}, metadata_ms={}, state_commit_ms={}",
+                    "completed: transferred={}, skipped={}, skipped_symlinks={}, bytes={}, delta_files={}, delta_fallbacks={}, bytes_saved={}, listing_ms={}, planning_ms={}, read_ms={}, write_ms={}, finalize_ms={}, metadata_ms={}, state_commit_ms={}",
                     summary.transferred_files,
                     summary.skipped_files,
+                    summary.skipped_symlinks,
                     summary.transferred_bytes,
                     summary.delta_files,
                     summary.delta_fallback_files,

@@ -133,8 +133,34 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
-    true
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, STILL_ACTIVE},
+            System::Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        };
+
+        // SAFETY: Win32 API contract; null/invalid handles are checked.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 impl StateStore {

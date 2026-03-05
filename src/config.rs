@@ -23,6 +23,7 @@ pub struct ResolvedConfig {
     pub verify_existing: bool,
     pub sftp_read_concurrency: usize,
     pub sftp_read_chunk_size: u64,
+    pub strict_windows_metadata: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -43,6 +44,7 @@ struct FileConfig {
     verify_existing: Option<bool>,
     sftp_read_concurrency: Option<usize>,
     sftp_read_chunk_size: Option<u64>,
+    strict_windows_metadata: Option<bool>,
 }
 
 impl ResolvedConfig {
@@ -154,6 +156,13 @@ impl ResolvedConfig {
             .or(file_cfg.sftp_read_chunk_size)
             .unwrap_or(4 * 1024 * 1024)
             .max(1);
+        let strict_windows_metadata = if cli.strict_windows_metadata {
+            true
+        } else {
+            env_parse::<bool>("PRSYNC_STRICT_WINDOWS_METADATA")
+                .or(file_cfg.strict_windows_metadata)
+                .unwrap_or(false)
+        };
 
         Ok(Self {
             jobs,
@@ -172,6 +181,7 @@ impl ResolvedConfig {
             verify_existing,
             sftp_read_concurrency,
             sftp_read_chunk_size,
+            strict_windows_metadata,
         })
     }
 }

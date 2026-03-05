@@ -123,6 +123,7 @@ fn opts(jobs: usize) -> SyncOptions {
         verify_existing: false,
         sftp_read_concurrency: 4,
         sftp_read_chunk_size: 4 * 1024 * 1024,
+        strict_windows_metadata: false,
     }
 }
 

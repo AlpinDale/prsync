@@ -1,15 +1,19 @@
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Once,
     },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
+};
+#[cfg(unix)]
+use std::{
+    io::Write,
+    process::{Command, Stdio},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -42,6 +46,7 @@ pub struct RunSummary {
     pub transfer_finalize_ms: u64,
     pub metadata_ms: u64,
     pub state_commit_ms: u64,
+    pub skipped_symlinks: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +79,7 @@ pub struct SyncOptions {
     pub verify_existing: bool,
     pub sftp_read_concurrency: usize,
     pub sftp_read_chunk_size: u64,
+    pub strict_windows_metadata: bool,
 }
 
 impl SyncOptions {
@@ -108,8 +114,19 @@ impl SyncOptions {
             verify_existing: resolved.verify_existing,
             sftp_read_concurrency: resolved.sftp_read_concurrency,
             sftp_read_chunk_size: resolved.sftp_read_chunk_size,
+            strict_windows_metadata: resolved.strict_windows_metadata,
         })
     }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Default)]
+struct RuntimeWarnings {
+    windows_acls: AtomicBool,
+    windows_xattrs: AtomicBool,
+    windows_owner_group: AtomicBool,
+    windows_perms: AtomicBool,
+    windows_symlink: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +156,7 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
     log_debug(
         &options,
         format!(
-            "starting sync source={} dest={} jobs={} chunk_size={} threshold={} resume={} strict_durability={} verify_existing={} sftp_read_concurrency={} sftp_read_chunk_size={}",
+            "starting sync source={} dest={} jobs={} chunk_size={} threshold={} resume={} strict_durability={} verify_existing={} sftp_read_concurrency={} sftp_read_chunk_size={} strict_windows_metadata={}",
             cli.remote_source,
             cli.local_destination.display(),
             options.jobs,
@@ -149,7 +166,8 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
             options.strict_durability,
             options.verify_existing,
             options.sftp_read_concurrency,
-            options.sftp_read_chunk_size
+            options.sftp_read_chunk_size,
+            options.strict_windows_metadata
         ),
     );
     let spec = RemoteSpec::parse(&cli.remote_source)?;
@@ -219,6 +237,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     let listing_ms = listing_started.elapsed().as_millis() as u64;
 
     let state = Arc::new(Mutex::new(StateStore::load(&state_root)?));
+    let warnings = Arc::new(RuntimeWarnings::default());
     {
         let valid_file_keys: HashSet<String> = entries
             .iter()
@@ -242,6 +261,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     let mut delta_eligible = 0_u64;
     let mut delta_planned = 0_u64;
     let mut skipped = 0_u64;
+    let mut skipped_symlinks = 0_u64;
     let planning_started = Instant::now();
 
     for entry in entries {
@@ -258,7 +278,14 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
                 fs::create_dir_all(&destination)
                     .with_context(|| format!("create dir: {}", destination.display()))?;
                 apply_mtime(&destination, entry.mtime_secs)?;
-                apply_metadata(remote, &entry.relative_path, &destination, &entry, options)?;
+                apply_metadata(
+                    remote,
+                    &entry.relative_path,
+                    &destination,
+                    &entry,
+                    options,
+                    &warnings,
+                )?;
             }
             EntryKind::Symlink => {
                 symlink_count += 1;
@@ -271,7 +298,27 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
                 if let Some(parent) = destination.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                create_or_replace_symlink(&destination, entry.link_target.as_ref())?;
+                if let Err(err) = create_or_replace_symlink(
+                    &destination,
+                    entry.link_target.as_ref(),
+                    &entry,
+                    options,
+                    &warnings,
+                ) {
+                    if is_windows() && !options.strict_windows_metadata {
+                        skipped_symlinks += 1;
+                        log_windows_warning(
+                            options,
+                            &warnings.windows_symlink,
+                            format!(
+                                "cannot create symlink {}; skipping on Windows ({err})",
+                                destination.display()
+                            ),
+                        );
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
             EntryKind::File => {
                 file_count += 1;
@@ -295,6 +342,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
                             &destination,
                             &entry,
                             options,
+                            &warnings,
                         )?;
                     }
                     skipped += 1;
@@ -345,7 +393,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
                 return;
             }
 
-            let outcome = match transfer_one(remote, job, options, &state, &ui, &perf) {
+            let outcome = match transfer_one(remote, job, options, &state, &ui, &perf, &warnings) {
                 Ok(v) => v,
                 Err(err) => {
                     let mut lock = errors.lock().expect("error lock");
@@ -377,6 +425,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     if let Some(err) = errs.pop() {
         return Err(err);
     }
+    drop(errs);
     ui.finish_all();
 
     let summary = RunSummary {
@@ -394,6 +443,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         transfer_finalize_ms: perf.transfer_finalize_ms.load(Ordering::Relaxed),
         metadata_ms: perf.metadata_ms.load(Ordering::Relaxed),
         state_commit_ms: perf.state_commit_ms.load(Ordering::Relaxed),
+        skipped_symlinks,
     };
     log_status(
         options,
@@ -403,14 +453,45 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         ),
     );
 
+    // Ensure all state/lock handles are closed before removing .prsync on Windows.
+    drop(state);
+    drop(ui);
     drop(destination_lock);
     log_status(options, "stage=finalizing: cleanup state directory...");
     if state_root.exists() {
-        fs::remove_dir_all(&state_root)
+        remove_state_root_with_retry(&state_root)
             .with_context(|| format!("cleanup state root: {}", state_root.display()))?;
     }
 
     Ok(summary)
+}
+
+fn remove_state_root_with_retry(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut last_err: Option<io::Error> = None;
+        for _ in 0..40 {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    last_err = Some(err);
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "timed out removing state directory",
+            )
+        }))
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::remove_dir_all(path)
+    }
 }
 
 fn should_transfer(
@@ -465,6 +546,7 @@ fn transfer_one<R: RemoteClient + Sync>(
     state: &Arc<Mutex<StateStore>>,
     ui: &Arc<TransferUi>,
     perf: &Arc<PerfCounters>,
+    warnings: &Arc<RuntimeWarnings>,
 ) -> Result<TransferOutcome> {
     vlog(
         options,
@@ -484,7 +566,7 @@ fn transfer_one<R: RemoteClient + Sync>(
         && job.destination.exists()
         && !options.dry_run
     {
-        match transfer_one_delta(remote, job, options, state, ui, perf) {
+        match transfer_one_delta(remote, job, options, state, ui, perf, warnings) {
             Ok(outcome) => return Ok(outcome),
             Err(err) => {
                 if options.delta_fallback {
@@ -691,6 +773,7 @@ fn transfer_one<R: RemoteClient + Sync>(
             &job.destination,
             &job.entry,
             options,
+            warnings,
         )?;
         perf.metadata_ms.fetch_add(
             metadata_started.elapsed().as_millis() as u64,
@@ -733,6 +816,7 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
     state: &Arc<Mutex<StateStore>>,
     ui: &Arc<TransferUi>,
     perf: &Arc<PerfCounters>,
+    warnings: &Arc<RuntimeWarnings>,
 ) -> Result<TransferOutcome> {
     let basis_path = &job.destination;
     let block_size = choose_block_size(job.entry.size, options.delta_block_size);
@@ -862,6 +946,7 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
         &job.destination,
         &job.entry,
         options,
+        warnings,
     )?;
     perf.metadata_ms.fetch_add(
         metadata_started.elapsed().as_millis() as u64,
@@ -998,6 +1083,20 @@ fn log_status(options: &SyncOptions, message: impl AsRef<str>) {
 fn log_debug(options: &SyncOptions, message: impl AsRef<str>) {
     if options.debug {
         eprintln!("[prsync][debug] {}", message.as_ref());
+    }
+}
+
+fn is_windows() -> bool {
+    cfg!(windows)
+}
+
+fn log_windows_warning(options: &SyncOptions, gate: &AtomicBool, message: String) {
+    if options.debug {
+        eprintln!("[prsync][warn] {message}");
+        return;
+    }
+    if !gate.swap(true, Ordering::SeqCst) {
+        eprintln!("[prsync][warn] {message}");
     }
 }
 
@@ -1243,7 +1342,11 @@ fn apply_metadata<R: RemoteClient + Sync>(
     path: &Path,
     entry: &RemoteEntry,
     options: &SyncOptions,
+    warnings: &Arc<RuntimeWarnings>,
 ) -> Result<()> {
+    #[cfg(not(windows))]
+    let _ = warnings;
+
     #[cfg(unix)]
     {
         use nix::unistd::{chown, Gid, Uid};
@@ -1283,12 +1386,59 @@ fn apply_metadata<R: RemoteClient + Sync>(
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = (remote, relative_path, path, entry, options);
-        if options.preserve_xattrs || options.preserve_acls {
-            bail!("ACL/xattr preservation is only supported on unix in v1");
+        let _ = (remote, relative_path, entry);
+        if options.preserve_perms {
+            log_windows_warning(
+                options,
+                &warnings.windows_perms,
+                "preserve perms (-p) has limited support on Windows; skipping".to_string(),
+            );
+            if let Ok(meta) = fs::metadata(path) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(entry.mode & 0o222 == 0);
+                let _ = fs::set_permissions(path, perms);
+            }
         }
+        if options.preserve_owner || options.preserve_group {
+            let msg = if options.strict_windows_metadata {
+                "preserve owner/group (-o/-g) is unsupported on Windows".to_string()
+            } else {
+                "preserve owner/group (-o/-g) is unsupported on Windows; skipping".to_string()
+            };
+            if options.strict_windows_metadata {
+                bail!("{msg}");
+            }
+            log_windows_warning(options, &warnings.windows_owner_group, msg);
+        }
+        if options.preserve_xattrs {
+            let msg = if options.strict_windows_metadata {
+                "preserve xattrs (-X) is unsupported on Windows".to_string()
+            } else {
+                "preserve xattrs (-X) is unsupported on Windows; skipping".to_string()
+            };
+            if options.strict_windows_metadata {
+                bail!("{msg}");
+            }
+            log_windows_warning(options, &warnings.windows_xattrs, msg);
+        }
+        if options.preserve_acls {
+            let msg = if options.strict_windows_metadata {
+                "preserve ACLs (-A) is unsupported on Windows".to_string()
+            } else {
+                "preserve ACLs (-A) is unsupported on Windows; skipping".to_string()
+            };
+            if options.strict_windows_metadata {
+                bail!("{msg}");
+            }
+            log_windows_warning(options, &warnings.windows_acls, msg);
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (remote, relative_path, path, entry, options, warnings);
     }
 
     Ok(())
@@ -1343,7 +1493,13 @@ fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_or_replace_symlink(link_path: &Path, target: Option<&PathBuf>) -> Result<()> {
+fn create_or_replace_symlink(
+    link_path: &Path,
+    target: Option<&PathBuf>,
+    _entry: &RemoteEntry,
+    _options: &SyncOptions,
+    _warnings: &Arc<RuntimeWarnings>,
+) -> Result<()> {
     let target = target.ok_or_else(|| anyhow!("symlink entry missing target"))?;
     if let Ok(existing) = fs::symlink_metadata(link_path) {
         if existing.file_type().is_symlink() || existing.is_file() {
@@ -1362,15 +1518,30 @@ fn create_or_replace_symlink(link_path: &Path, target: Option<&PathBuf>) -> Resu
                 target.display()
             )
         })?;
+        Ok(())
     }
 
     #[cfg(not(unix))]
     {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::{symlink_dir, symlink_file};
+            let result = symlink_file(target, link_path).or_else(|file_err| {
+                symlink_dir(target, link_path).map_err(|dir_err| {
+                    anyhow!(
+                        "create symlink {} -> {} failed (file: {file_err}, dir: {dir_err})",
+                        link_path.display(),
+                        target.display()
+                    )
+                })
+            });
+            result
+        }
+        #[cfg(not(windows))]
         let _ = (target, link_path);
-        bail!("symlink creation is only supported on unix in v1");
+        #[cfg(not(windows))]
+        return Err(anyhow!("symlink creation is only supported on unix in v1"));
     }
-
-    Ok(())
 }
 
 fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
@@ -1391,7 +1562,24 @@ fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> 
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+
+        while !buf.is_empty() {
+            let n = file.seek_write(buf, offset)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write all bytes",
+                ));
+            }
+            buf = &buf[n..];
+            offset += n as u64;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (file, buf, offset);
         Err(io::Error::new(
@@ -1568,6 +1756,7 @@ mod tests {
             verify_existing: false,
             sftp_read_concurrency: 4,
             sftp_read_chunk_size: 4 * 1024 * 1024,
+            strict_windows_metadata: false,
         }
     }
 
