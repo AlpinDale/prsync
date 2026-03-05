@@ -425,6 +425,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     if let Some(err) = errs.pop() {
         return Err(err);
     }
+    drop(errs);
     ui.finish_all();
 
     let summary = RunSummary {
@@ -452,14 +453,45 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         ),
     );
 
+    // Ensure all state/lock handles are closed before removing .prsync on Windows.
+    drop(state);
+    drop(ui);
     drop(destination_lock);
     log_status(options, "stage=finalizing: cleanup state directory...");
     if state_root.exists() {
-        fs::remove_dir_all(&state_root)
+        remove_state_root_with_retry(&state_root)
             .with_context(|| format!("cleanup state root: {}", state_root.display()))?;
     }
 
     Ok(summary)
+}
+
+fn remove_state_root_with_retry(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut last_err: Option<io::Error> = None;
+        for _ in 0..40 {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    last_err = Some(err);
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        return Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "timed out removing state directory",
+            )
+        }));
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::remove_dir_all(path)
+    }
 }
 
 fn should_transfer(
