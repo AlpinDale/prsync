@@ -480,12 +480,12 @@ fn remove_state_root_with_retry(path: &Path) -> io::Result<()> {
                 Err(err) => return Err(err),
             }
         }
-        return Err(last_err.unwrap_or_else(|| {
+        Err(last_err.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "timed out removing state directory",
             )
-        }));
+        }))
     }
 
     #[cfg(not(windows))]
