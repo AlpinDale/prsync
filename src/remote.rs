@@ -1,11 +1,12 @@
 use std::{
     collections::HashSet,
-    ffi::OsString,
     io::{Read, Seek, SeekFrom, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
 };
+#[cfg(unix)]
+use std::ffi::OsString;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -1532,9 +1533,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        glob_match, is_missing_remote_command, load_ssh_config_path, parse_find_record,
-        parse_macos_xattrs, parse_ssh_config, parse_xattrs, EntryKind, RemoteSpec,
+        glob_match, is_missing_remote_command, load_ssh_config_path, parse_macos_xattrs,
+        parse_ssh_config, parse_xattrs, RemoteSpec,
     };
+    #[cfg(unix)]
+    use super::{parse_find_record, EntryKind};
 
     #[test]
     fn parse_remote_spec_user_host() {

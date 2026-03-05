@@ -146,13 +146,13 @@ fn process_is_alive(pid: u32) -> bool {
         // SAFETY: Win32 API contract; null/invalid handles are checked.
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle == 0 {
+            if handle.is_null() {
                 return false;
             }
             let mut code: u32 = 0;
             let ok = GetExitCodeProcess(handle, &mut code);
             CloseHandle(handle);
-            ok != 0 && code == STILL_ACTIVE
+            ok != 0 && code == STILL_ACTIVE as u32
         }
     }
 

@@ -1,15 +1,19 @@
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Once,
     },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
+};
+#[cfg(unix)]
+use std::{
+    io::Write,
+    process::{Command, Stdio},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -1482,6 +1486,7 @@ fn create_or_replace_symlink(
                 target.display()
             )
         })?;
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -1489,28 +1494,22 @@ fn create_or_replace_symlink(
         #[cfg(windows)]
         {
             use std::os::windows::fs::{symlink_dir, symlink_file};
-
-            match symlink_file(target, link_path) {
-                Ok(()) => return Ok(()),
-                Err(file_err) => match symlink_dir(target, link_path) {
-                    Ok(()) => return Ok(()),
-                    Err(dir_err) => {
-                        return Err(anyhow!(
-                            "create symlink {} -> {} failed (file: {file_err}, dir: {dir_err})",
-                            link_path.display(),
-                            target.display()
-                        ));
-                    }
-                },
-            }
+            let result = symlink_file(target, link_path).or_else(|file_err| {
+                symlink_dir(target, link_path).map_err(|dir_err| {
+                    anyhow!(
+                        "create symlink {} -> {} failed (file: {file_err}, dir: {dir_err})",
+                        link_path.display(),
+                        target.display()
+                    )
+                })
+            });
+            return result;
         }
         #[cfg(not(windows))]
         let _ = (target, link_path);
         #[cfg(not(windows))]
-        bail!("symlink creation is only supported on unix in v1");
+        return Err(anyhow!("symlink creation is only supported on unix in v1"));
     }
-
-    Ok(())
 }
 
 fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
