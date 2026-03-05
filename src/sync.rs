@@ -1503,7 +1503,7 @@ fn create_or_replace_symlink(
                     )
                 })
             });
-            return result;
+            result
         }
         #[cfg(not(windows))]
         let _ = (target, link_path);
