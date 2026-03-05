@@ -1,0 +1,32 @@
+[package]
+name = "prsync"
+version = "0.1.0"
+edition = "2021"
+description = "Parallel rsync-like pull sync over SSH with resume"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+filetime = "0.2"
+glob = "0.3"
+indicatif = "0.17"
+rayon = "1.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ssh2 = "0.9"
+thiserror = "2.0"
+toml = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+xattr = "1.4"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["user", "fs", "signal", "process"] }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.15"
