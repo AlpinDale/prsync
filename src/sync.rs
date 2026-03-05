@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashSet,
     fs::{self, File, OpenOptions},
     io,
@@ -20,6 +21,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use filetime::{set_file_mtime, FileTime};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
+
+thread_local! {
+    static READ_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 use crate::{
     cli::Cli,
@@ -655,52 +660,61 @@ fn transfer_one<R: RemoteClient + Sync>(
                 let len = remain.min(chunk_size);
                 let mut last_err: Option<anyhow::Error> = None;
 
-                for _ in 0..options.retries {
-                    if is_interrupted() {
-                        return Err(anyhow!("interrupted by signal"));
-                    }
-                    let read_started = Instant::now();
-                    match remote.read_range(&job.entry.relative_path, offset, len) {
-                        Ok(buf) => {
-                            read_ms.fetch_add(
-                                read_started.elapsed().as_millis() as u64,
-                                Ordering::Relaxed,
-                            );
-                            if buf.len() as u64 != len {
-                                last_err = Some(anyhow!(
-                                    "short read for {}: expected {}, got {}",
-                                    job.entry.relative_path.display(),
-                                    len,
-                                    buf.len()
-                                ));
-                                continue;
-                            }
-                            let write_started = Instant::now();
-                            write_all_at(part_file.as_ref(), &buf, offset)?;
-                            write_ms.fetch_add(
-                                write_started.elapsed().as_millis() as u64,
-                                Ordering::Relaxed,
-                            );
-                            if let Ok(mut done) = completed_in_attempt.lock() {
-                                done.push(*idx);
-                            }
-                            ui.inc_chunk_bytes(len);
-                            attempt_transferred.fetch_add(len, Ordering::Relaxed);
-                            return Ok(());
+                READ_SCRATCH.with(|scratch| -> Result<()> {
+                    let mut buf = scratch.borrow_mut();
+                    for _ in 0..options.retries {
+                        if is_interrupted() {
+                            return Err(anyhow!("interrupted by signal"));
                         }
-                        Err(err) => {
-                            read_ms.fetch_add(
-                                read_started.elapsed().as_millis() as u64,
-                                Ordering::Relaxed,
-                            );
-                            last_err = Some(err);
+                        let read_started = Instant::now();
+                        match remote.read_range_into(
+                            &job.entry.relative_path,
+                            offset,
+                            len,
+                            &mut buf,
+                        ) {
+                            Ok(()) => {
+                                read_ms.fetch_add(
+                                    read_started.elapsed().as_millis() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                if buf.len() as u64 != len {
+                                    last_err = Some(anyhow!(
+                                        "short read for {}: expected {}, got {}",
+                                        job.entry.relative_path.display(),
+                                        len,
+                                        buf.len()
+                                    ));
+                                    continue;
+                                }
+                                let write_started = Instant::now();
+                                write_all_at(part_file.as_ref(), &buf, offset)?;
+                                write_ms.fetch_add(
+                                    write_started.elapsed().as_millis() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                if let Ok(mut done) = completed_in_attempt.lock() {
+                                    done.push(*idx);
+                                }
+                                ui.inc_chunk_bytes(len);
+                                attempt_transferred.fetch_add(len, Ordering::Relaxed);
+                                return Ok(());
+                            }
+                            Err(err) => {
+                                read_ms.fetch_add(
+                                    read_started.elapsed().as_millis() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                last_err = Some(err);
+                            }
                         }
                     }
-                }
 
-                Err(last_err
-                    .unwrap_or_else(|| anyhow!("chunk transfer failed"))
-                    .context("chunk transfer failed after retries"))
+                    Err(last_err
+                        .take()
+                        .unwrap_or_else(|| anyhow!("chunk transfer failed"))
+                        .context("chunk transfer failed after retries"))
+                })
             })?;
         }
         perf.transfer_read_ms

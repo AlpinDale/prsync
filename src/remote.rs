@@ -130,6 +130,16 @@ pub trait RemoteClient {
         self.list_entries(recursive)
     }
     fn read_range(&self, relative_path: &Path, offset: u64, len: u64) -> Result<Vec<u8>>;
+    fn read_range_into(
+        &self,
+        relative_path: &Path,
+        offset: u64,
+        len: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        *buf = self.read_range(relative_path, offset, len)?;
+        Ok(())
+    }
     fn stat_file(&self, relative_path: &Path) -> Result<RemoteFileStat>;
     fn generate_delta_plan(
         &self,
@@ -450,6 +460,34 @@ impl RemoteClient for SshRemote {
         Err(last_err.unwrap_or_else(|| anyhow!("unable to read range")))
     }
 
+    fn read_range_into(
+        &self,
+        relative_path: &Path,
+        offset: u64,
+        len: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        let full_path = self.remote_path_for(relative_path);
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for _ in 0..2 {
+            let mut conn = self.pool.checkout()?;
+            match conn.read_range_into(&full_path, offset, len, buf) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    last_err = Some(
+                        err.context(format!("sftp read failed for {}", relative_path.display())),
+                    );
+                    if let Ok(reconnected) = self.pool.connect_one() {
+                        conn.replace(reconnected);
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("unable to read range")))
+    }
+
     fn stat_file(&self, relative_path: &Path) -> Result<RemoteFileStat> {
         let full_path = self.remote_path_for(relative_path);
         let mut conn = self.pool.checkout()?;
@@ -668,6 +706,18 @@ impl Connection {
     }
 
     fn read_range(&mut self, path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.read_range_into(path, offset, len, &mut buf)?;
+        Ok(buf)
+    }
+
+    fn read_range_into(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
         let needs_open = self
             .open_read_path
             .as_ref()
@@ -690,7 +740,8 @@ impl Connection {
         file.seek(SeekFrom::Start(offset))
             .with_context(|| format!("sftp seek failed: {}", path.display()))?;
 
-        let mut buf = vec![0_u8; len as usize];
+        buf.clear();
+        buf.resize(len as usize, 0);
         let mut read = 0_usize;
         while read < buf.len() {
             let n = file.read(&mut buf[read..]).with_context(|| {
@@ -702,7 +753,7 @@ impl Connection {
             read += n;
         }
         buf.truncate(read);
-        Ok(buf)
+        Ok(())
     }
 
     fn exec(&mut self, cmd: &str) -> Result<ExecOutput> {
@@ -773,7 +824,7 @@ impl Connection {
             .with_context(|| format!("exec remote command: {cmd}"))?;
 
         let mut out = Vec::new();
-        let mut pending = Vec::<u8>::new();
+        let mut pending = Vec::<u8>::with_capacity(128 * 1024);
         let mut read_buf = [0_u8; 64 * 1024];
 
         loop {
@@ -783,10 +834,12 @@ impl Connection {
             }
             pending.extend_from_slice(&read_buf[..n]);
 
-            while let Some(pos) = pending.iter().position(|b| *b == 0) {
-                let rec: Vec<u8> = pending.drain(..pos).collect();
-                pending.drain(..1);
-                if let Some(entry) = parse_find_record(&rec, star_children_mode)? {
+            let mut parsed_through = 0_usize;
+            while let Some(pos) = pending[parsed_through..].iter().position(|b| *b == 0) {
+                let end = parsed_through + pos;
+                if let Some(entry) =
+                    parse_find_record(&pending[parsed_through..end], star_children_mode)?
+                {
                     out.push(entry);
                     if out.len().is_multiple_of(100) {
                         if let Some(cb) = progress {
@@ -794,6 +847,11 @@ impl Connection {
                         }
                     }
                 }
+                parsed_through = end + 1;
+            }
+
+            if parsed_through > 0 {
+                pending.drain(..parsed_through);
             }
         }
 
@@ -1018,6 +1076,19 @@ impl<'a> PooledConnection<'a> {
             .as_mut()
             .ok_or_else(|| anyhow!("missing pooled connection"))?
             .read_range(path, offset, len)
+    }
+
+    fn read_range_into(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .read_range_into(path, offset, len, buf)
     }
 
     fn exec(&mut self, cmd: &str) -> Result<ExecOutput> {
