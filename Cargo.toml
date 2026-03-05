@@ -27,6 +27,9 @@ xattr = "1.4"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["user", "fs", "signal", "process"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"

@@ -122,6 +122,10 @@ pub struct Cli {
     #[arg(long = "sftp-read-chunk-size")]
     pub sftp_read_chunk_size: Option<u64>,
 
+    /// On Windows, fail when requested metadata/symlink preservation is unsupported
+    #[arg(long = "strict-windows-metadata", action = ArgAction::SetTrue)]
+    pub strict_windows_metadata: bool,
+
     /// SSH remote source spec: `[user@]host:/path`
     pub remote_source: String,
 

@@ -149,12 +149,55 @@ jobs:
             prsync-${{ github.ref_name }}-${{ matrix.archive_platform }}.sha256
           if-no-files-found: error
 
+  build-windows:
+    name: build windows (x86_64-windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Restore Windows build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows-x86_64
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Version = "${env:GITHUB_REF_NAME}"
+          $Name = "prsync-$Version-x86_64-windows"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/prsync.exe" "dist/prsync.exe"
+          Copy-Item "README.md" "dist/README.md"
+          Copy-Item "LICENSE" "dist/LICENSE"
+          Compress-Archive -Path "dist/prsync.exe","dist/README.md","dist/LICENSE" -DestinationPath "$Name.zip" -Force
+          (Get-FileHash "$Name.zip" -Algorithm SHA256).Hash.ToLower() + "  $Name.zip" | Out-File -NoNewline "$Name.sha256"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: prsync-x86_64-windows
+          path: |
+            prsync-${{ github.ref_name }}-x86_64-windows.zip
+            prsync-${{ github.ref_name }}-x86_64-windows.sha256
+          if-no-files-found: error
+
   publish:
     name: publish release
     runs-on: ubuntu-latest
     needs:
       - build-linux
       - build-macos
+      - build-windows
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
