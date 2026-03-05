@@ -75,16 +75,14 @@ jobs:
 
   build-macos:
     name: build macos (${{ matrix.archive_platform }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
-            target: x86_64-apple-darwin
+          - target: x86_64-apple-darwin
             archive_platform: x86_64-macos
-          - runner: macos-14
-            target: aarch64-apple-darwin
+          - target: aarch64-apple-darwin
             archive_platform: aarch64-macos
     steps:
       - name: Checkout
