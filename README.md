@@ -3,6 +3,8 @@
 `prsync` is a high-throughput, resumable pull syncs from SSH remotes. In
 essence, a parallelized `rsync` implementation.
 
+![demo](assets/demo.gif)
+
 ## Building
 
 Make sure you have Rust stable installed (via rustup), then:
