@@ -317,6 +317,7 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     };
     print_plan_summary(options, &plan_summary);
     log_debug(options, "stage=transferring: starting file workers...");
+    let transfer_started = Instant::now();
     let ui = Arc::new(TransferUi::new(jobs.len() as u64, total_bytes, options));
 
     let transferred_files = AtomicU64::new(0);
@@ -394,6 +395,13 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         metadata_ms: perf.metadata_ms.load(Ordering::Relaxed),
         state_commit_ms: perf.state_commit_ms.load(Ordering::Relaxed),
     };
+    log_status(
+        options,
+        format!(
+            "transfer duration: {}",
+            format_duration_human(transfer_started.elapsed())
+        ),
+    );
 
     drop(destination_lock);
     log_status(options, "stage=finalizing: cleanup state directory...");
@@ -1044,6 +1052,27 @@ fn format_bytes_human(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
+fn format_duration_human(duration: Duration) -> String {
+    let mut secs = duration.as_secs();
+    let days = secs / 86_400;
+    secs %= 86_400;
+    let hours = secs / 3_600;
+    secs %= 3_600;
+    let mins = secs / 60;
+    secs %= 60;
+
+    if days > 0 {
+        return format!("{days}d {hours}h {mins}m {secs}s");
+    }
+    if hours > 0 {
+        return format!("{hours}h {mins}m {secs}s");
+    }
+    if mins > 0 {
+        return format!("{mins}m {secs}s");
+    }
+    format!("{secs}s")
+}
+
 #[derive(Debug)]
 struct TransferUi {
     _multi: MultiProgress,
@@ -1150,10 +1179,13 @@ impl TransferUi {
     fn finish_all(&self) {
         let files_done = self.transferred_files.load(Ordering::Relaxed);
         let total = self.transferred_bytes.load(Ordering::Relaxed);
+        let elapsed = self.started_at.elapsed().as_secs_f64().max(0.001);
+        let mibps = (total as f64 / (1024.0 * 1024.0)) / elapsed;
         if !self.bar.is_finished() {
             self.bar.finish_with_message(format!(
-                "files {files_done}/{} | {} B",
-                self.total_files, total
+                "files {files_done}/{} | {mibps:.2} MiB/s | {}",
+                self.total_files,
+                format_bytes_human(total)
             ));
         }
         if !self.file_line.is_finished() {
