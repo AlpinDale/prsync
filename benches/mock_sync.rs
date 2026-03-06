@@ -116,15 +116,18 @@ fn scenarios() -> Vec<Scenario> {
         build_scenario("Many small (1000x4KB)", 1000, |_| 4 * 1024, 2),
         build_scenario("Medium (40x128KB)", 40, |_| 128 * 1024, 5),
         build_scenario("Few large (5x10MB)", 5, |_| 10 * 1024 * 1024, 10),
-        build_scenario("Mixed (200 varied)", 200, |i| {
-            match i % 5 {
+        build_scenario(
+            "Mixed (200 varied)",
+            200,
+            |i| match i % 5 {
                 0 => 1024,
                 1 => 4 * 1024,
                 2 => 32 * 1024,
                 3 => 256 * 1024,
                 _ => 2 * 1024 * 1024,
-            }
-        }, 5),
+            },
+            5,
+        ),
     ]
 }
 
