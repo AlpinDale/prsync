@@ -4,7 +4,7 @@ use clap::{ArgAction, Parser};
 #[command(
     name = "parsync",
     version,
-    about = "Parallel rsync-like pull sync over SSH"
+    about = "Parallel rsync-like sync over SSH or local paths"
 )]
 pub struct Cli {
     /// Increase log verbosity
@@ -126,7 +126,7 @@ pub struct Cli {
     #[arg(long = "strict-windows-metadata", action = ArgAction::SetTrue)]
     pub strict_windows_metadata: bool,
 
-    /// SSH remote source spec: `[user@]host:/path`
+    /// Source path or SSH remote source spec: `[user@]host:/path`
     pub remote_source: String,
 
     /// Local destination path

@@ -1,7 +1,6 @@
 # parsync
 
-`parsync` is a high-throughput, resumable pull sync from SSH remotes, with
-parallel file transfers and optional block-delta sync.
+`parsync` is a high-throughput, resumable sync tool for SSH remotes and local-to-local transfers, with parallel file transfers and optional block-delta sync.
 
 ![demo](assets/demo.gif)
 

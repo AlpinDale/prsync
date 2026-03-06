@@ -1,8 +1,11 @@
 #[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::process::Command;
 use std::{
     collections::HashSet,
-    io::{Read, Seek, SeekFrom, Write},
+    fs,
+    io::{self, Read, Seek, SeekFrom, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
@@ -10,9 +13,12 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ssh2::{File, FileStat, Session, Sftp};
+use ssh2::{File as SftpFile, FileStat, Session, Sftp};
 
-use crate::delta::protocol::{BlockSigWire, DeltaPlan, HelperRequest, HelperResponse};
+use crate::delta::{
+    build_delta_ops,
+    protocol::{BlockSigWire, DeltaPlan, HelperRequest, HelperResponse},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSpec {
@@ -22,6 +28,50 @@ pub struct RemoteSpec {
     pub port_explicit: bool,
     pub path: String,
     pub path_trailing_star: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceSpec {
+    Remote(RemoteSpec),
+    Local(LocalSourceSpec),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSourceSpec {
+    pub path: PathBuf,
+    pub path_trailing_star: bool,
+}
+
+pub fn parse_source_spec(input: &str) -> Result<SourceSpec> {
+    if let Some(spec) = LocalSourceSpec::parse_existing(input)? {
+        return Ok(SourceSpec::Local(spec));
+    }
+
+    if looks_like_local_source(input) {
+        bail!("local source path not found: {input}");
+    }
+
+    Ok(SourceSpec::Remote(RemoteSpec::parse(input)?))
+}
+
+impl LocalSourceSpec {
+    pub fn parse_existing(input: &str) -> Result<Option<Self>> {
+        let (raw_path, trailing_star) = normalize_local_source_path(input)?;
+        let path = PathBuf::from(raw_path);
+        if !path.exists() {
+            return Ok(None);
+        }
+        if trailing_star && !path.is_dir() {
+            bail!(
+                "local source path must be a directory when using trailing /*: {}",
+                path.display()
+            );
+        }
+        Ok(Some(Self {
+            path,
+            path_trailing_star: trailing_star,
+        }))
+    }
 }
 
 impl RemoteSpec {
@@ -75,6 +125,44 @@ fn parse_host_port(host_port: &str) -> Result<(String, u16, bool)> {
         }
     }
     Ok((host_port.to_string(), 22, false))
+}
+
+fn normalize_local_source_path(raw: &str) -> Result<(&str, bool)> {
+    if raw.ends_with("/*") {
+        let trimmed = raw.trim_end_matches('*').trim_end_matches('/');
+        if trimmed.is_empty() {
+            bail!("invalid local source path: {raw}");
+        }
+        return Ok((trimmed, true));
+    }
+
+    if raw.contains('*') || raw.contains('?') || raw.contains('[') || raw.contains(']') {
+        bail!("unsupported local glob pattern: {raw}. Use a concrete path or trailing /*");
+    }
+
+    Ok((raw, false))
+}
+
+fn looks_like_local_source(input: &str) -> bool {
+    if input.starts_with('/')
+        || input.starts_with("./")
+        || input.starts_with("../")
+        || input.starts_with('~')
+        || input.starts_with(r"\")
+    {
+        return true;
+    }
+
+    let bytes = input.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+
+    !input.contains(':')
 }
 
 fn normalize_source_path(raw: &str) -> Result<String> {
@@ -150,6 +238,10 @@ pub trait RemoteClient {
     fn get_xattrs(&self, _relative_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         Ok(Vec::new())
     }
+
+    fn try_fast_copy(&self, _relative_path: &Path, _destination: &Path) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 #[derive(Clone)]
@@ -191,11 +283,17 @@ impl SshRemote {
     }
 
     fn remote_path_for(&self, relative_path: &Path) -> PathBuf {
-        if self.root_kind == EntryKind::Dir {
-            self.root_path.join(relative_path)
-        } else {
-            self.root_path.clone()
+        if self.root_kind != EntryKind::Dir {
+            return self.root_path.clone();
         }
+        let source_relative = if self.star_children_mode {
+            relative_path
+        } else {
+            relative_path
+                .strip_prefix(&self.root_basename)
+                .unwrap_or(relative_path)
+        };
+        self.root_path.join(source_relative)
     }
 
     fn collect_single_root_entry(&self) -> Result<RemoteEntry> {
@@ -226,8 +324,14 @@ impl SshRemote {
         progress: Option<&dyn Fn(usize)>,
     ) -> Result<Vec<RemoteEntry>> {
         let mut out = Vec::new();
-        let mut stack = vec![(self.root_path.clone(), PathBuf::new())];
-        let mut found = 0_usize;
+        let initial_rel = if self.star_children_mode {
+            PathBuf::new()
+        } else {
+            out.push(self.collect_single_root_entry()?);
+            self.root_basename.clone()
+        };
+        let mut stack = vec![(self.root_path.clone(), initial_rel)];
+        let mut found = out.len();
 
         while let Some((remote_dir, rel_dir)) = stack.pop() {
             let mut conn = self.pool.checkout()?;
@@ -320,6 +424,13 @@ impl SshRemote {
             progress,
         )?;
 
+        if !self.star_children_mode {
+            for entry in &mut out {
+                entry.relative_path = self.root_basename.join(&entry.relative_path);
+            }
+            out.push(self.collect_single_root_entry()?);
+        }
+
         out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         if let Some(cb) = progress {
             cb(out.len());
@@ -399,6 +510,247 @@ PY"#;
             shell_quote_word(py)
         );
         self.run_exec_output(&cmd)
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalFsRemote {
+    root_path: PathBuf,
+    root_kind: EntryKind,
+    root_basename: PathBuf,
+    star_children_mode: bool,
+}
+
+impl LocalFsRemote {
+    pub fn connect(spec: LocalSourceSpec) -> Result<Self> {
+        let metadata = fs::symlink_metadata(&spec.path)
+            .with_context(|| format!("local source path not found: {}", spec.path.display()))?;
+        let root_kind = entry_kind_from_metadata(&metadata);
+        let root_basename = spec
+            .path
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Ok(Self {
+            root_path: spec.path,
+            root_kind,
+            root_basename,
+            star_children_mode: spec.path_trailing_star,
+        })
+    }
+
+    fn local_path_for(&self, relative_path: &Path) -> PathBuf {
+        if self.root_kind != EntryKind::Dir {
+            return self.root_path.clone();
+        }
+        let source_relative = if self.star_children_mode {
+            relative_path
+        } else {
+            relative_path
+                .strip_prefix(&self.root_basename)
+                .unwrap_or(relative_path)
+        };
+        self.root_path.join(source_relative)
+    }
+
+    fn collect_single_root_entry(&self) -> Result<RemoteEntry> {
+        local_entry_from_path(self.root_basename.clone(), &self.root_path)
+    }
+
+    fn walk_dir(
+        &self,
+        recursive: bool,
+        progress: Option<&dyn Fn(usize)>,
+    ) -> Result<Vec<RemoteEntry>> {
+        let mut out = Vec::new();
+        let initial_rel = if self.star_children_mode {
+            PathBuf::new()
+        } else {
+            out.push(self.collect_single_root_entry()?);
+            self.root_basename.clone()
+        };
+        let mut stack = vec![(self.root_path.clone(), initial_rel)];
+        let mut found = out.len();
+
+        while let Some((local_dir, rel_dir)) = stack.pop() {
+            let mut entries = fs::read_dir(&local_dir)
+                .with_context(|| format!("failed listing local dir: {}", local_dir.display()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .with_context(|| format!("failed listing local dir: {}", local_dir.display()))?;
+            entries.sort_by_key(|entry| entry.file_name());
+
+            for child in entries {
+                let name = child.file_name();
+                if name == "." || name == ".." {
+                    continue;
+                }
+
+                let full_path = child.path();
+                let child_rel = if rel_dir.as_os_str().is_empty() {
+                    PathBuf::from(&name)
+                } else {
+                    rel_dir.join(&name)
+                };
+                let entry = local_entry_from_path(child_rel.clone(), &full_path)?;
+                if recursive && entry.kind == EntryKind::Dir {
+                    stack.push((full_path, child_rel));
+                }
+                out.push(entry);
+                found += 1;
+                if found.is_multiple_of(200) {
+                    if let Some(cb) = progress {
+                        cb(found);
+                    }
+                }
+            }
+
+            if !recursive {
+                break;
+            }
+        }
+
+        out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        if let Some(cb) = progress {
+            cb(found);
+        }
+        Ok(out)
+    }
+}
+
+impl RemoteClient for LocalFsRemote {
+    fn list_entries(&self, recursive: bool) -> Result<Vec<RemoteEntry>> {
+        self.list_entries_with_progress(recursive, None)
+    }
+
+    fn list_entries_with_progress(
+        &self,
+        recursive: bool,
+        progress: Option<&dyn Fn(usize)>,
+    ) -> Result<Vec<RemoteEntry>> {
+        if self.root_kind == EntryKind::Dir {
+            self.walk_dir(recursive, progress)
+        } else {
+            Ok(vec![self.collect_single_root_entry()?])
+        }
+    }
+
+    fn read_range(&self, relative_path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let full_path = self.local_path_for(relative_path);
+        let mut file = fs::File::open(&full_path)
+            .with_context(|| format!("open local source file: {}", full_path.display()))?;
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seek local source file: {}", full_path.display()))?;
+        let mut buf = vec![0_u8; len as usize];
+        let mut read = 0_usize;
+        while read < buf.len() {
+            let n = file
+                .read(&mut buf[read..])
+                .with_context(|| format!("read local source file: {}", full_path.display()))?;
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        buf.truncate(read);
+        Ok(buf)
+    }
+
+    fn stat_file(&self, relative_path: &Path) -> Result<RemoteFileStat> {
+        let full_path = self.local_path_for(relative_path);
+        let metadata = fs::symlink_metadata(&full_path)
+            .with_context(|| format!("stat local source file: {}", full_path.display()))?;
+        Ok(RemoteFileStat {
+            size: metadata.len(),
+            mtime_secs: metadata_mtime_secs(&metadata),
+        })
+    }
+
+    fn generate_delta_plan(
+        &self,
+        relative_path: &Path,
+        _source_size: u64,
+        _source_mtime_secs: i64,
+        block_size: u32,
+        blocks: &[BlockSigWire],
+        _helper_command: &str,
+    ) -> Result<DeltaPlan> {
+        let full_path = self.local_path_for(relative_path);
+        let data = fs::read(&full_path)
+            .with_context(|| format!("read local source file: {}", full_path.display()))?;
+        let metadata = fs::symlink_metadata(&full_path)
+            .with_context(|| format!("stat local source file: {}", full_path.display()))?;
+        let response = build_delta_ops(&data, metadata_mtime_secs(&metadata), block_size, blocks)?;
+        Ok(DeltaPlan {
+            ops: response.ops,
+            final_digest_hex: response.final_digest_hex,
+            literal_bytes: response.literal_bytes,
+            copy_bytes: response.copy_bytes,
+            source_size: response.source_size,
+            source_mtime_secs: response.source_mtime_secs,
+        })
+    }
+
+    fn get_acl_text(&self, relative_path: &Path) -> Result<Option<String>> {
+        #[cfg(unix)]
+        {
+            let full_path = self.local_path_for(relative_path);
+            let output = Command::new("getfacl")
+                .arg("--absolute-names")
+                .arg("-p")
+                .arg("--")
+                .arg(&full_path)
+                .output()
+                .with_context(|| format!("spawn getfacl for {}", full_path.display()))?;
+            if output.status.success() {
+                return String::from_utf8(output.stdout)
+                    .context("local command output was not valid utf-8")
+                    .map(Some);
+            }
+            bail!(
+                "local ACL query failed for {} ({}): {}. Install/support getfacl locally or disable -A/--acls",
+                full_path.display(),
+                output.status.code().unwrap_or_default(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = relative_path;
+            Ok(None)
+        }
+    }
+
+    fn get_xattrs(&self, relative_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+        #[cfg(unix)]
+        {
+            let full_path = self.local_path_for(relative_path);
+            let mut attrs = Vec::new();
+            for name in xattr::list(&full_path)
+                .with_context(|| format!("list xattrs for {}", full_path.display()))?
+            {
+                let value = xattr::get(&full_path, &name)
+                    .with_context(|| {
+                        format!(
+                            "read xattr {} for {}",
+                            name.to_string_lossy(),
+                            full_path.display()
+                        )
+                    })?
+                    .unwrap_or_default();
+                attrs.push((name.to_string_lossy().to_string(), value));
+            }
+            Ok(attrs)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = relative_path;
+            Ok(Vec::new())
+        }
+    }
+
+    fn try_fast_copy(&self, relative_path: &Path, destination: &Path) -> Result<bool> {
+        let source = self.local_path_for(relative_path);
+        fast_copy_local_file(&source, destination)
     }
 }
 
@@ -618,7 +970,7 @@ struct Connection {
     session: Session,
     sftp: Sftp,
     open_read_path: Option<PathBuf>,
-    open_read_file: Option<File>,
+    open_read_file: Option<SftpFile>,
 }
 
 struct ExecOutput {
@@ -1054,6 +1406,190 @@ impl Drop for PooledConnection<'_> {
             let _ = self.pool.checkin(conn);
         }
     }
+}
+
+fn local_entry_from_path(relative_path: PathBuf, full_path: &Path) -> Result<RemoteEntry> {
+    let metadata = fs::symlink_metadata(full_path)
+        .with_context(|| format!("stat local source path: {}", full_path.display()))?;
+    let kind = entry_kind_from_metadata(&metadata);
+    let (mode, uid, gid) = metadata_mode_uid_gid(&metadata, &kind);
+    let link_target = if kind == EntryKind::Symlink {
+        fs::read_link(full_path).ok()
+    } else {
+        None
+    };
+
+    Ok(RemoteEntry {
+        relative_path,
+        kind,
+        size: if matches!(entry_kind_from_metadata(&metadata), EntryKind::File) {
+            metadata.len()
+        } else {
+            0
+        },
+        mtime_secs: metadata_mtime_secs(&metadata),
+        mode,
+        uid,
+        gid,
+        link_target,
+    })
+}
+
+fn entry_kind_from_metadata(metadata: &fs::Metadata) -> EntryKind {
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        EntryKind::Dir
+    } else if file_type.is_symlink() {
+        EntryKind::Symlink
+    } else {
+        EntryKind::File
+    }
+}
+
+fn metadata_mtime_secs(metadata: &fs::Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.mtime()
+    }
+    #[cfg(not(unix))]
+    {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
+fn metadata_mode_uid_gid(
+    metadata: &fs::Metadata,
+    _kind: &EntryKind,
+) -> (u32, Option<u32>, Option<u32>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.mode() & 0o7777,
+            Some(metadata.uid()),
+            Some(metadata.gid()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let mode = match kind {
+            EntryKind::Dir => {
+                if metadata.permissions().readonly() {
+                    0o555
+                } else {
+                    0o755
+                }
+            }
+            EntryKind::Symlink => 0o777,
+            EntryKind::File => {
+                if metadata.permissions().readonly() {
+                    0o444
+                } else {
+                    0o644
+                }
+            }
+        };
+        (mode, None, None)
+    }
+}
+
+#[cfg(unix)]
+fn fast_copy_local_file(source: &Path, destination: &Path) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        let src = CString::new(source.as_os_str().as_encoded_bytes())
+            .with_context(|| format!("source path contains interior NUL: {}", source.display()))?;
+        let dst = CString::new(destination.as_os_str().as_encoded_bytes()).with_context(|| {
+            format!(
+                "destination path contains interior NUL: {}",
+                destination.display()
+            )
+        })?;
+        let rc = unsafe { nix::libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(nix::libc::ENOTSUP | nix::libc::EXDEV | nix::libc::EEXIST | nix::libc::EINVAL) => {
+                let _ = fs::remove_file(destination);
+                Ok(false)
+            }
+            _ => {
+                let _ = fs::remove_file(destination);
+                Err(err).with_context(|| {
+                    format!(
+                        "clonefile {} -> {}",
+                        source.display(),
+                        destination.display()
+                    )
+                })
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let src = fs::File::open(source)
+            .with_context(|| format!("open local fast-copy source: {}", source.display()))?;
+        let dst = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(destination)
+            .with_context(|| {
+                format!(
+                    "open local fast-copy destination: {}",
+                    destination.display()
+                )
+            })?;
+        let rc =
+            unsafe { nix::libc::ioctl(dst.as_raw_fd(), nix::libc::FICLONE as _, src.as_raw_fd()) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        let _ = fs::remove_file(destination);
+        match err.raw_os_error() {
+            Some(code)
+                if matches!(
+                    code,
+                    nix::libc::EOPNOTSUPP
+                        | nix::libc::ENOTSUP
+                        | nix::libc::EXDEV
+                        | nix::libc::EINVAL
+                        | nix::libc::ENOTTY
+                ) =>
+            {
+                Ok(false)
+            }
+            _ => Err(err).with_context(|| {
+                format!("reflink {} -> {}", source.display(), destination.display())
+            }),
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = source;
+        let _ = destination;
+        Ok(false)
+    }
+}
+
+#[cfg(not(unix))]
+fn fast_copy_local_file(source: &Path, destination: &Path) -> Result<bool> {
+    let _ = source;
+    let _ = destination;
+    Ok(false)
 }
 
 fn entry_kind_from_stat(stat: &FileStat) -> Result<EntryKind> {
@@ -1534,10 +2070,69 @@ mod tests {
 
     use super::{
         glob_match, is_missing_remote_command, load_ssh_config_path, parse_macos_xattrs,
-        parse_ssh_config, parse_xattrs, RemoteSpec,
+        parse_source_spec, parse_ssh_config, parse_xattrs, LocalSourceSpec, RemoteSpec, SourceSpec,
     };
     #[cfg(unix)]
     use super::{parse_find_record, EntryKind};
+
+    #[test]
+    fn parses_existing_local_source_file() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("book.epub");
+        std::fs::write(&path, b"data").expect("write");
+
+        let spec = parse_source_spec(&path.to_string_lossy()).expect("parse");
+        match spec {
+            SourceSpec::Local(LocalSourceSpec {
+                path: parsed,
+                path_trailing_star,
+            }) => {
+                assert_eq!(parsed, path);
+                assert!(!path_trailing_star);
+            }
+            other => panic!("expected local source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_existing_local_source_with_trailing_star() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("library");
+        std::fs::create_dir_all(&path).expect("mkdir");
+
+        let spec = parse_source_spec(&format!("{}/*", path.display())).expect("parse");
+        match spec {
+            SourceSpec::Local(LocalSourceSpec {
+                path: parsed,
+                path_trailing_star,
+            }) => {
+                assert_eq!(parsed, path);
+                assert!(path_trailing_star);
+            }
+            other => panic!("expected local source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_remote_source_when_local_path_is_absent() {
+        let spec = parse_source_spec("alice@example.com:/srv/data").expect("parse");
+        match spec {
+            SourceSpec::Remote(remote) => assert_eq!(remote.host, "example.com"),
+            other => panic!("expected remote source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_local_source_without_guessing_remote() {
+        let err = parse_source_spec("missing-local-source").expect_err("must fail");
+        assert!(format!("{err:#}").contains("local source path not found"));
+    }
+
+    #[test]
+    fn windows_style_path_is_treated_as_local() {
+        let err = parse_source_spec(r"C:\ebooks").expect_err("must fail");
+        assert!(format!("{err:#}").contains("local source path not found"));
+    }
 
     #[test]
     fn parse_remote_spec_user_host() {

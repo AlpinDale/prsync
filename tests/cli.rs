@@ -15,10 +15,10 @@ fn help_contains_expected_flags() {
 }
 
 #[test]
-fn invalid_remote_spec_fails() {
+fn missing_local_source_fails() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("parsync"));
     cmd.args(["-r", "invalid-spec", "/tmp/dst"]);
-    cmd.assert().failure().stderr(predicate::str::contains(
-        "remote must be in format [user@]host:/path",
-    ));
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("local source path not found"));
 }

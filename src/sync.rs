@@ -26,7 +26,10 @@ use crate::{
     config::ResolvedConfig,
     delta::{apply_delta_ops, build_signature, choose_block_size, BlockSig},
     hashing::{format_digest, hash_file},
-    remote::{EntryKind, RemoteClient, RemoteEntry, RemoteSpec, SshRemote},
+    remote::{
+        parse_source_spec, EntryKind, LocalFsRemote, RemoteClient, RemoteEntry, SourceSpec,
+        SshRemote,
+    },
     state::{acquire_destination_lock, DeltaSessionState, StateStore},
 };
 
@@ -171,38 +174,50 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
             options.strict_windows_metadata
         ),
     );
-    let spec = RemoteSpec::parse(&cli.remote_source)?;
-    log_debug(
-        &options,
-        format!(
-            "parsed remote host={} port={} path={}",
-            spec.host, spec.port, spec.path
-        ),
-    );
-    log_status(
-        &options,
-        "stage=connecting: establishing ssh connection pool...",
-    );
-    let remote = SshRemote::connect(spec, options.jobs)?;
-    log_status(
-        &options,
-        "stage=connecting: ssh connection pool established",
-    );
-    let summary = run_sync_with_client(&remote, &cli.local_destination, &options)?;
-    let disconnect_started = Instant::now();
-    log_debug(
-        &options,
-        "stage=disconnecting: closing ssh connection pool...",
-    );
-    drop(remote);
-    log_debug(
-        &options,
-        format!(
-            "stage=disconnecting: closed ssh connection pool in {}ms",
-            disconnect_started.elapsed().as_millis()
-        ),
-    );
-    Ok(summary)
+
+    match parse_source_spec(&cli.remote_source)? {
+        SourceSpec::Local(spec) => {
+            log_debug(
+                &options,
+                format!("parsed local source path={}", spec.path.display()),
+            );
+            let remote = LocalFsRemote::connect(spec)?;
+            run_sync_with_client(&remote, &cli.local_destination, &options)
+        }
+        SourceSpec::Remote(spec) => {
+            log_debug(
+                &options,
+                format!(
+                    "parsed remote host={} port={} path={}",
+                    spec.host, spec.port, spec.path
+                ),
+            );
+            log_status(
+                &options,
+                "stage=connecting: establishing ssh connection pool...",
+            );
+            let remote = SshRemote::connect(spec, options.jobs)?;
+            log_status(
+                &options,
+                "stage=connecting: ssh connection pool established",
+            );
+            let summary = run_sync_with_client(&remote, &cli.local_destination, &options)?;
+            let disconnect_started = Instant::now();
+            log_debug(
+                &options,
+                "stage=disconnecting: closing ssh connection pool...",
+            );
+            drop(remote);
+            log_debug(
+                &options,
+                format!(
+                    "stage=disconnecting: closed ssh connection pool in {}ms",
+                    disconnect_started.elapsed().as_millis()
+                ),
+            );
+            Ok(summary)
+        }
+    }
 }
 
 pub fn run_sync_with_client<R: RemoteClient + Sync>(
@@ -571,6 +586,11 @@ fn transfer_one<R: RemoteClient + Sync>(
         fs::create_dir_all(parent)?;
     }
 
+    if let Some(outcome) = try_fast_copy_transfer(remote, job, options, state, ui, perf, warnings)?
+    {
+        return Ok(outcome);
+    }
+
     let mut delta_fallbacked = false;
     if options.delta_enabled
         && job.entry.size >= options.delta_min_size
@@ -823,6 +843,100 @@ fn transfer_one<R: RemoteClient + Sync>(
     }
 
     bail!("unexpected transfer retry exhaustion")
+}
+
+fn try_fast_copy_transfer<R: RemoteClient + Sync>(
+    remote: &R,
+    job: &FileJob,
+    options: &SyncOptions,
+    state: &Arc<Mutex<StateStore>>,
+    ui: &Arc<TransferUi>,
+    perf: &Arc<PerfCounters>,
+    warnings: &Arc<RuntimeWarnings>,
+) -> Result<Option<TransferOutcome>> {
+    if options.resume
+        || options.delta_enabled
+        || options.dry_run
+        || job.entry.kind != EntryKind::File
+    {
+        return Ok(None);
+    }
+
+    let part_path = {
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        let part_path = locked.part_path_for(&job.entry.relative_path);
+        if part_path.exists() || locked.file_state(&job.entry.relative_path)?.is_some() {
+            return Ok(None);
+        }
+        part_path
+    };
+
+    if !remote.try_fast_copy(&job.entry.relative_path, &part_path)? {
+        let _ = fs::remove_file(&part_path);
+        return Ok(None);
+    }
+
+    if options.strict_durability {
+        File::open(&part_path)
+            .with_context(|| format!("open fast-copy partial: {}", part_path.display()))?
+            .sync_all()?;
+    }
+
+    let finalize_started = Instant::now();
+    validate_destination_path(
+        &job.destination_root,
+        &job.entry.relative_path,
+        &job.entry.kind,
+    )?;
+    fs::rename(&part_path, &job.destination).with_context(|| {
+        format!(
+            "rename fast-copy partial to destination: {} -> {}",
+            part_path.display(),
+            job.destination.display()
+        )
+    })?;
+    apply_mtime(&job.destination, job.entry.mtime_secs)?;
+    perf.transfer_finalize_ms.fetch_add(
+        finalize_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
+
+    let metadata_started = Instant::now();
+    apply_metadata(
+        remote,
+        &job.entry.relative_path,
+        &job.destination,
+        &job.entry,
+        options,
+        warnings,
+    )?;
+    perf.metadata_ms.fetch_add(
+        metadata_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
+
+    let state_started = Instant::now();
+    {
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        if options.verify_existing {
+            let digest = format_digest(hash_file(&job.destination)?);
+            locked.mark_finished_with_digest(&job.entry.relative_path, digest)?;
+        } else {
+            locked.mark_finished(&job.entry.relative_path)?;
+        }
+        locked.save()?;
+    }
+    perf.state_commit_ms.fetch_add(
+        state_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
+    ui.inc_chunk_bytes(job.entry.size);
+
+    Ok(Some(TransferOutcome {
+        used_delta: false,
+        delta_fallback: false,
+        bytes_saved: 0,
+    }))
 }
 
 fn transfer_one_delta<R: RemoteClient + Sync>(
@@ -1684,11 +1798,12 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
+        cli::Cli,
         delta::protocol::{BlockSigWire, DeltaOp, DeltaPlan},
         remote::{EntryKind, RemoteClient, RemoteEntry, RemoteFileStat},
     };
 
-    use super::{run_sync_with_client, SyncOptions};
+    use super::{run_sync, run_sync_with_client, SyncOptions};
 
     #[derive(Debug)]
     struct MockRemote {
@@ -1807,6 +1922,43 @@ mod tests {
         }
     }
 
+    fn local_cli(source: String, destination: PathBuf) -> Cli {
+        Cli {
+            verbose: false,
+            debug: false,
+            recursive: true,
+            progress_partial: false,
+            links: true,
+            update: false,
+            preserve_perms: false,
+            preserve_owner: false,
+            preserve_group: false,
+            preserve_acls: false,
+            preserve_xattrs: false,
+            jobs: Some(4),
+            chunk_size: Some(8),
+            chunk_threshold: Some(8),
+            retries: Some(2),
+            state_dir: None,
+            no_resume: false,
+            resume: true,
+            dry_run: false,
+            delta: false,
+            delta_min_size: None,
+            delta_block_size: None,
+            delta_max_literals: None,
+            delta_helper: None,
+            no_delta_fallback: false,
+            strict_durability: false,
+            verify_existing: false,
+            sftp_read_concurrency: Some(1),
+            sftp_read_chunk_size: Some(4 * 1024 * 1024),
+            strict_windows_metadata: false,
+            remote_source: source,
+            local_destination: destination,
+        }
+    }
+
     fn opts() -> SyncOptions {
         SyncOptions {
             verbose: false,
@@ -1839,6 +1991,123 @@ mod tests {
             sftp_read_chunk_size: 4 * 1024 * 1024,
             strict_windows_metadata: false,
         }
+    }
+
+    #[test]
+    fn local_run_sync_copies_single_file() {
+        let src = TempDir::new().expect("src");
+        let dst = TempDir::new().expect("dst");
+        let source = src.path().join("book.epub");
+        fs::write(&source, b"hello local").expect("write");
+
+        let summary = run_sync(local_cli(
+            source.to_string_lossy().to_string(),
+            dst.path().to_path_buf(),
+        ))
+        .expect("sync");
+
+        assert_eq!(summary.transferred_files, 1);
+        assert_eq!(
+            fs::read(dst.path().join("book.epub")).expect("read"),
+            b"hello local"
+        );
+    }
+
+    #[test]
+    fn local_run_sync_directory_keeps_root_container() {
+        let src = TempDir::new().expect("src");
+        let dst = TempDir::new().expect("dst");
+        let root = src.path().join("library");
+        fs::create_dir_all(root.join("nested")).expect("mkdir");
+        fs::write(root.join("nested").join("chapter.txt"), b"chapter").expect("write");
+
+        let summary = run_sync(local_cli(
+            root.to_string_lossy().to_string(),
+            dst.path().to_path_buf(),
+        ))
+        .expect("sync");
+
+        assert_eq!(summary.transferred_files, 1);
+        assert!(dst
+            .path()
+            .join("library")
+            .join("nested")
+            .join("chapter.txt")
+            .exists());
+    }
+
+    #[test]
+    fn local_run_sync_trailing_star_copies_children_only() {
+        let src = TempDir::new().expect("src");
+        let dst = TempDir::new().expect("dst");
+        let root = src.path().join("library");
+        fs::create_dir_all(root.join("nested")).expect("mkdir");
+        fs::write(root.join("nested").join("chapter.txt"), b"chapter").expect("write");
+
+        let summary = run_sync(local_cli(
+            format!("{}/*", root.display()),
+            dst.path().to_path_buf(),
+        ))
+        .expect("sync");
+
+        assert_eq!(summary.transferred_files, 1);
+        assert!(dst.path().join("nested").join("chapter.txt").exists());
+        assert!(!dst.path().join("library").exists());
+    }
+
+    #[test]
+    fn local_run_sync_uses_delta_when_enabled() {
+        let src = TempDir::new().expect("src");
+        let dst = TempDir::new().expect("dst");
+        let source = src.path().join("large.bin");
+        let mut src_bytes = vec![b'A'; 128 * 1024];
+        src_bytes[32 * 1024..40 * 1024].fill(b'Z');
+        fs::write(&source, &src_bytes).expect("write source");
+        let basis = dst.path().join("large.bin");
+        fs::write(&basis, vec![b'A'; 128 * 1024]).expect("write basis");
+        filetime::set_file_mtime(&basis, filetime::FileTime::from_unix_time(1_700_000_000, 0))
+            .expect("set basis mtime");
+        filetime::set_file_mtime(
+            &source,
+            filetime::FileTime::from_unix_time(1_700_000_100, 0),
+        )
+        .expect("set source mtime");
+
+        let mut cli = local_cli(
+            source.to_string_lossy().to_string(),
+            dst.path().to_path_buf(),
+        );
+        cli.delta = true;
+        cli.delta_min_size = Some(1);
+        cli.delta_block_size = Some(4096);
+        cli.delta_max_literals = Some(64 * 1024);
+
+        let summary = run_sync(cli).expect("sync");
+        assert_eq!(summary.delta_files, 1);
+        assert_eq!(
+            fs::read(dst.path().join("large.bin")).expect("read"),
+            src_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_run_sync_preserves_symlink() {
+        let src = TempDir::new().expect("src");
+        let dst = TempDir::new().expect("dst");
+        let root = src.path().join("library");
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("target.txt"), b"target").expect("write");
+        std::os::unix::fs::symlink("target.txt", root.join("link.txt")).expect("symlink");
+
+        run_sync(local_cli(
+            root.to_string_lossy().to_string(),
+            dst.path().to_path_buf(),
+        ))
+        .expect("sync");
+
+        let link = fs::read_link(dst.path().join("library").join("link.txt")).expect("read link");
+        assert_eq!(link, PathBuf::from("target.txt"));
     }
 
     #[test]
