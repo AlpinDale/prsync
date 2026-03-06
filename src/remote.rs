@@ -14,6 +14,82 @@ use ssh2::{File, FileStat, Session, Sftp};
 
 use crate::delta::protocol::{BlockSigWire, DeltaPlan, HelperRequest, HelperResponse};
 
+/// Parsed S3 source specification from `s3://bucket/prefix`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Spec {
+    pub bucket: String,
+    pub prefix: String,
+    pub prefix_trailing_star: bool,
+    pub region: Option<String>,
+    pub endpoint_url: Option<String>,
+    pub profile: Option<String>,
+}
+
+/// Dispatch enum for SSH vs S3 sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceSpec {
+    Ssh(RemoteSpec),
+    S3(S3Spec),
+}
+
+impl SourceSpec {
+    /// Parse a remote source string, dispatching to S3 or SSH.
+    ///
+    /// S3 sources: `s3://bucket/prefix` or `s3://bucket/prefix/*`
+    /// SSH sources: `[user@]host:/path`
+    pub fn parse(
+        input: &str,
+        s3_region: Option<&str>,
+        s3_endpoint_url: Option<&str>,
+        s3_profile: Option<&str>,
+    ) -> Result<Self> {
+        if input.starts_with("s3://") {
+            let rest = &input[5..]; // strip "s3://"
+            if rest.is_empty() {
+                bail!("s3:// URL must include a bucket name");
+            }
+
+            let trailing_star = rest.ends_with("/*");
+            let rest_clean = if trailing_star {
+                rest.trim_end_matches('*').trim_end_matches('/')
+            } else {
+                rest.trim_end_matches('/')
+            };
+
+            let (bucket, prefix) = match rest_clean.split_once('/') {
+                Some((b, p)) => (b.to_string(), p.to_string()),
+                None => (rest_clean.to_string(), String::new()),
+            };
+
+            if bucket.is_empty() {
+                bail!("s3:// URL must include a non-empty bucket name");
+            }
+
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = (&bucket, &prefix, &trailing_star, &s3_region, &s3_endpoint_url, &s3_profile);
+                bail!(
+                    "S3 sources require parsync to be compiled with --features s3"
+                );
+            }
+
+            #[cfg(feature = "s3")]
+            {
+                return Ok(SourceSpec::S3(S3Spec {
+                    bucket,
+                    prefix,
+                    prefix_trailing_star: trailing_star,
+                    region: s3_region.map(String::from),
+                    endpoint_url: s3_endpoint_url.map(String::from),
+                    profile: s3_profile.map(String::from),
+                }));
+            }
+        }
+
+        Ok(SourceSpec::Ssh(RemoteSpec::parse(input)?))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSpec {
     pub user: Option<String>,
@@ -131,6 +207,17 @@ pub trait RemoteClient {
     }
     fn read_range(&self, relative_path: &Path, offset: u64, len: u64) -> Result<Vec<u8>>;
     fn stat_file(&self, relative_path: &Path) -> Result<RemoteFileStat>;
+
+    /// Whether this backend supports SSH-exec-based delta transfer.
+    fn supports_delta(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend supports block-level delta via local hashing + range reads.
+    fn supports_block_delta(&self) -> bool {
+        false
+    }
+
     fn generate_delta_plan(
         &self,
         _relative_path: &Path,
@@ -403,6 +490,10 @@ PY"#;
 }
 
 impl RemoteClient for SshRemote {
+    fn supports_delta(&self) -> bool {
+        true
+    }
+
     fn list_entries(&self, recursive: bool) -> Result<Vec<RemoteEntry>> {
         self.list_entries_with_progress(recursive, None)
     }

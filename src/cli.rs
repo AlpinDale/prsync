@@ -4,7 +4,7 @@ use clap::{ArgAction, Parser};
 #[command(
     name = "parsync",
     version,
-    about = "Parallel rsync-like pull sync over SSH"
+    about = "Parallel rsync-like pull sync over SSH or S3"
 )]
 pub struct Cli {
     /// Increase log verbosity
@@ -126,7 +126,19 @@ pub struct Cli {
     #[arg(long = "strict-windows-metadata", action = ArgAction::SetTrue)]
     pub strict_windows_metadata: bool,
 
-    /// SSH remote source spec: `[user@]host:/path`
+    /// AWS region for S3 sources (e.g. us-east-1)
+    #[arg(long = "s3-region")]
+    pub s3_region: Option<String>,
+
+    /// Custom S3 endpoint URL (for MinIO, LocalStack, etc.)
+    #[arg(long = "s3-endpoint-url")]
+    pub s3_endpoint_url: Option<String>,
+
+    /// AWS profile name for S3 sources
+    #[arg(long = "s3-profile")]
+    pub s3_profile: Option<String>,
+
+    /// Remote source: `[user@]host:/path` (SSH) or `s3://bucket/prefix` (S3)
     pub remote_source: String,
 
     /// Local destination path

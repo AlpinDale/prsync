@@ -26,9 +26,11 @@ use crate::{
     config::ResolvedConfig,
     delta::{apply_delta_ops, build_signature, choose_block_size, BlockSig},
     hashing::{format_digest, hash_file},
-    remote::{EntryKind, RemoteClient, RemoteEntry, RemoteSpec, SshRemote},
+    remote::{EntryKind, RemoteClient, RemoteEntry, SourceSpec, SshRemote},
     state::{acquire_destination_lock, DeltaSessionState, StateStore},
 };
+#[cfg(feature = "s3")]
+use crate::s3::S3Remote;
 
 #[derive(Debug, Clone)]
 pub struct RunSummary {
@@ -170,38 +172,89 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
             options.strict_windows_metadata
         ),
     );
-    let spec = RemoteSpec::parse(&cli.remote_source)?;
-    log_debug(
-        &options,
-        format!(
-            "parsed remote host={} port={} path={}",
-            spec.host, spec.port, spec.path
-        ),
-    );
-    log_status(
-        &options,
-        "stage=connecting: establishing ssh connection pool...",
-    );
-    let remote = SshRemote::connect(spec, options.jobs)?;
-    log_status(
-        &options,
-        "stage=connecting: ssh connection pool established",
-    );
-    let summary = run_sync_with_client(&remote, &cli.local_destination, &options)?;
-    let disconnect_started = Instant::now();
-    log_debug(
-        &options,
-        "stage=disconnecting: closing ssh connection pool...",
-    );
-    drop(remote);
-    log_debug(
-        &options,
-        format!(
-            "stage=disconnecting: closed ssh connection pool in {}ms",
-            disconnect_started.elapsed().as_millis()
-        ),
-    );
-    Ok(summary)
+    let source = SourceSpec::parse(
+        &cli.remote_source,
+        cli.s3_region.as_deref(),
+        cli.s3_endpoint_url.as_deref(),
+        cli.s3_profile.as_deref(),
+    )?;
+
+    match source {
+        SourceSpec::Ssh(spec) => {
+            log_debug(
+                &options,
+                format!(
+                    "parsed remote host={} port={} path={}",
+                    spec.host, spec.port, spec.path
+                ),
+            );
+            log_status(
+                &options,
+                "stage=connecting: establishing ssh connection pool...",
+            );
+            let remote = SshRemote::connect(spec, options.jobs)?;
+            log_status(
+                &options,
+                "stage=connecting: ssh connection pool established",
+            );
+            let summary = run_sync_with_client(&remote, &cli.local_destination, &options)?;
+            let disconnect_started = Instant::now();
+            log_debug(
+                &options,
+                "stage=disconnecting: closing ssh connection pool...",
+            );
+            drop(remote);
+            log_debug(
+                &options,
+                format!(
+                    "stage=disconnecting: closed ssh connection pool in {}ms",
+                    disconnect_started.elapsed().as_millis()
+                ),
+            );
+            Ok(summary)
+        }
+        #[cfg(feature = "s3")]
+        SourceSpec::S3(spec) => {
+            log_debug(
+                &options,
+                format!(
+                    "parsed S3 source bucket={} prefix={}",
+                    spec.bucket, spec.prefix
+                ),
+            );
+
+            // Warn about flags that have no effect for S3 sources.
+            if options.links {
+                log_status(&options, "warning: --links has no effect for S3 sources (S3 has no symlinks)");
+            }
+            if options.preserve_perms {
+                log_status(&options, "warning: --perms has no effect for S3 sources");
+            }
+            if options.preserve_owner {
+                log_status(&options, "warning: --owner has no effect for S3 sources");
+            }
+            if options.preserve_group {
+                log_status(&options, "warning: --group has no effect for S3 sources");
+            }
+            if options.preserve_acls {
+                log_status(&options, "warning: --acls has no effect for S3 sources");
+            }
+            if options.preserve_xattrs {
+                log_status(&options, "warning: --xattrs has no effect for S3 sources");
+            }
+
+            log_status(&options, "stage=connecting: connecting to S3...");
+            let remote = S3Remote::connect(spec)?;
+            log_status(&options, "stage=connecting: S3 client ready");
+            let summary = run_sync_with_client(&remote, &cli.local_destination, &options)?;
+            drop(remote);
+            Ok(summary)
+        }
+        #[cfg(not(feature = "s3"))]
+        SourceSpec::S3(_) => {
+            unreachable!("S3 source parsed but s3 feature not enabled")
+        }
+    }
 }
 
 pub fn run_sync_with_client<R: RemoteClient + Sync>(

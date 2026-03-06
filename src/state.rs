@@ -494,9 +494,93 @@ fn migrate(conn: &Connection) -> Result<()> {
             finished INTEGER NOT NULL,
             last_op_index INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS file_blocks (
+            file_path   TEXT NOT NULL,
+            block_index INTEGER NOT NULL,
+            block_hash  TEXT NOT NULL,
+            block_size  INTEGER NOT NULL,
+            etag        TEXT NOT NULL DEFAULT '',
+            last_seen   INTEGER NOT NULL,
+            PRIMARY KEY (file_path, block_index)
+        );
         ",
     )?;
     Ok(())
+}
+
+/// Block-level delta state for S3 sources.
+///
+/// Tracks BLAKE3 hashes of fixed-size blocks per file, enabling incremental
+/// re-sync by downloading only changed blocks via S3 range reads.
+impl StateStore {
+    /// Check if a block's hash matches the stored value.
+    pub fn block_matches(
+        &self,
+        file_path: &Path,
+        block_index: u64,
+        hash: &str,
+    ) -> Result<bool> {
+        let key = Self::key_for(file_path);
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT block_hash FROM file_blocks WHERE file_path = ?1 AND block_index = ?2",
+                params![key, block_index as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(stored.as_deref() == Some(hash))
+    }
+
+    /// Store or update a block hash.
+    pub fn upsert_block(
+        &self,
+        file_path: &Path,
+        block_index: u64,
+        block_hash: &str,
+        block_size: u32,
+        etag: &str,
+    ) -> Result<()> {
+        let key = Self::key_for(file_path);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            "INSERT INTO file_blocks (file_path, block_index, block_hash, block_size, etag, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(file_path, block_index) DO UPDATE SET
+                block_hash = excluded.block_hash,
+                block_size = excluded.block_size,
+                etag = excluded.etag,
+                last_seen = excluded.last_seen",
+            params![key, block_index as i64, block_hash, block_size as i64, etag, now],
+        )?;
+        Ok(())
+    }
+
+    /// Remove all block entries for a given file.
+    pub fn clear_blocks(&self, file_path: &Path) -> Result<()> {
+        let key = Self::key_for(file_path);
+        self.conn
+            .execute("DELETE FROM file_blocks WHERE file_path = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Get the stored ETag for a file's blocks (from the first block entry).
+    pub fn block_etag(&self, file_path: &Path) -> Result<Option<String>> {
+        let key = Self::key_for(file_path);
+        let etag: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT etag FROM file_blocks WHERE file_path = ?1 LIMIT 1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(etag.filter(|s| !s.is_empty()))
+    }
 }
 
 fn part_name_for(key: &str) -> String {

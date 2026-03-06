@@ -2,11 +2,15 @@
 name = "parsync"
 version = "0.2.0"
 edition = "2021"
-description = "Parallel rsync-like pull sync over SSH with resume"
+description = "Parallel rsync-like pull sync over SSH or S3 with resume"
 license = "MIT"
 repository = "https://github.com/AlpinDale/parsync"
 homepage = "https://github.com/AlpinDale/parsync"
 documentation = "https://docs.rs/parsync"
+
+[features]
+default = []
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-types", "dep:tokio", "dep:blake3"]
 
 [dependencies]
 anyhow = "1.0"
@@ -25,6 +29,13 @@ ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 thiserror = "2.0"
 toml = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# S3 backend (optional, behind "s3" feature)
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+aws-types = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+blake3 = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["user", "fs", "signal", "process"] }
