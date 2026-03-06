@@ -133,6 +133,7 @@ struct RuntimeWarnings {
 struct FileJob {
     entry: RemoteEntry,
     destination: PathBuf,
+    destination_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -267,7 +268,8 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     for entry in entries {
         check_interrupted()?;
         validate_relative_path(&entry.relative_path)?;
-        let destination = local_destination.join(&entry.relative_path);
+        let destination =
+            validate_destination_path(local_destination, &entry.relative_path, &entry.kind)?;
 
         match entry.kind {
             EntryKind::Dir => {
@@ -333,7 +335,11 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
                     if delta_this_file {
                         delta_planned += 1;
                     }
-                    jobs.push(FileJob { entry, destination });
+                    jobs.push(FileJob {
+                        entry,
+                        destination,
+                        destination_root: local_destination.to_path_buf(),
+                    });
                 } else {
                     if !options.dry_run && should_apply_file_metadata(options) {
                         apply_metadata(
@@ -556,6 +562,11 @@ fn transfer_one<R: RemoteClient + Sync>(
             job.entry.size
         ),
     );
+    validate_destination_path(
+        &job.destination_root,
+        &job.entry.relative_path,
+        &job.entry.kind,
+    )?;
     if let Some(parent) = job.destination.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -754,6 +765,11 @@ fn transfer_one<R: RemoteClient + Sync>(
         }
 
         let finalize_started = Instant::now();
+        validate_destination_path(
+            &job.destination_root,
+            &job.entry.relative_path,
+            &job.entry.kind,
+        )?;
         fs::rename(&part_path, &job.destination).with_context(|| {
             format!(
                 "rename partial to destination: {} -> {}",
@@ -818,6 +834,11 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
     perf: &Arc<PerfCounters>,
     warnings: &Arc<RuntimeWarnings>,
 ) -> Result<TransferOutcome> {
+    validate_destination_path(
+        &job.destination_root,
+        &job.entry.relative_path,
+        &job.entry.kind,
+    )?;
     let basis_path = &job.destination;
     let block_size = choose_block_size(job.entry.size, options.delta_block_size);
     let sig = build_signature(basis_path, block_size)?;
@@ -927,6 +948,11 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
     }
 
     let finalize_started = Instant::now();
+    validate_destination_path(
+        &job.destination_root,
+        &job.entry.relative_path,
+        &job.entry.kind,
+    )?;
     fs::rename(&part_path, &job.destination).with_context(|| {
         format!(
             "rename delta partial to destination: {} -> {}",
@@ -1493,6 +1519,61 @@ fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_destination_path(
+    root: &Path,
+    relative_path: &Path,
+    kind: &EntryKind,
+) -> Result<PathBuf> {
+    let destination = root.join(relative_path);
+    let mut current = root.to_path_buf();
+
+    for (idx, component) in relative_path.components().enumerate() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(part) => current.push(part),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "unsafe remote path component in {}",
+                    relative_path.display()
+                )
+            }
+        }
+
+        let is_last = idx + 1 == relative_path.components().count();
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() && !(is_last && matches!(kind, EntryKind::Symlink)) {
+                    bail!(
+                        "destination path traverses symlink outside sync root: {}",
+                        current.display()
+                    );
+                }
+                if !is_last && !metadata.is_dir() {
+                    bail!(
+                        "destination parent is not a directory: {}",
+                        current.display()
+                    );
+                }
+                if is_last && matches!(kind, EntryKind::Dir) && !metadata.is_dir() {
+                    bail!(
+                        "destination directory path is not a directory: {}",
+                        current.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("inspect destination path component: {}", current.display())
+                })
+            }
+        }
+    }
+
+    Ok(destination)
+}
+
 fn create_or_replace_symlink(
     link_path: &Path,
     target: Option<&PathBuf>,
@@ -2013,6 +2094,34 @@ mod tests {
         let err = run_sync_with_client(&remote, dir.path(), &opts()).expect_err("must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("unsafe remote path component"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_destination_parent_symlink_escape() {
+        let dir = TempDir::new().expect("tmp");
+        let outside = TempDir::new().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape"))
+            .expect("make symlink");
+
+        let entry = RemoteEntry {
+            relative_path: PathBuf::from("escape/file.txt"),
+            kind: EntryKind::File,
+            size: 4,
+            mtime_secs: 1700000005,
+            mode: 0o644,
+            uid: None,
+            gid: None,
+            link_target: None,
+        };
+        let mut files = BTreeMap::new();
+        files.insert(PathBuf::from("escape/file.txt"), b"evil".to_vec());
+        let remote = MockRemote::new(vec![entry], files);
+
+        let err = run_sync_with_client(&remote, dir.path(), &opts()).expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("destination path traverses symlink"));
+        assert!(!outside.path().join("file.txt").exists());
     }
 
     #[cfg(unix)]
