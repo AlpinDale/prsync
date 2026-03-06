@@ -4,6 +4,9 @@ version = "0.2.0"
 edition = "2021"
 description = "Parallel rsync-like pull sync over SSH with resume"
 license = "MIT"
+repository = "https://github.com/AlpinDale/parsync"
+homepage = "https://github.com/AlpinDale/parsync"
+documentation = "https://docs.rs/parsync"
 
 [dependencies]
 anyhow = "1.0"
